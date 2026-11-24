@@ -6,8 +6,8 @@
 > ersetzen.
 
 MCP-Server für **immo-erp** (Alias für eine Immobilienverwaltungs-Software). Er sucht Objekte (Häuser nach Straße), Wirtschaftseinheiten,
-Einheiten, Mietverträge und Kontakte und **liest nur**: Er schickt ausschließlich `GET`-Anfragen an die
-immo-erp-API. Der Login läuft über den Keycloak des Herstellers mit Passwort und TOTP-Code und hält die Sitzung
+Einheiten, Mietverträge, Mietkonten und Kontakte. **Standardmäßig liest er nur** (`GET`). Schreiben, derzeit
+nur „Kontakt anlegen“, ist aus und muss ausdrücklich freigeschaltet werden (siehe [Schreiben](#schreiben-optional)). Der Login läuft über den Keycloak des Herstellers mit Passwort und TOTP-Code und hält die Sitzung
 danach selbst so lange wie möglich am Leben.
 
 ## Installation
@@ -130,6 +130,8 @@ gebraucht.
 | `wodis_get_mietkonto` | Mietkonto eines Vertrags: Kontobewegungen (Sollstellungen, Zahlungen, Storni) mit laufendem Saldo und Summen. Positiver Saldo = Rückstand, negativer Saldo = Guthaben |
 | `wodis_search_kontakte`, `wodis_get_kontakt` | Mieter und Firmen mit Kontaktdaten |
 | `wodis_list_mandanten` | Mandanten |
+| `wodis_check_kontakt_dubletten` | Dubletten-Prüfung wie vor dem Anlegen (nur lesend) |
+| `wodis_create_kontakt` | **Schreibend**, nur mit Freigabe: Kontakt (natürliche Person) anlegen |
 
 Typischer Ablauf: `wodis_search_objekte(strasse)` → `wodis_get_objekt` → `wodis_get_einheit` →
 `wodis_get_mietvertrag` → `wodis_get_kontakt`, für Zahlungen und Rückstände `wodis_get_mietkonto`.
@@ -148,11 +150,42 @@ Typischer Ablauf: `wodis_search_objekte(strasse)` → `wodis_get_objekt` → `wo
 | `WODIS_LOGIN_PUBLIC_URL` | – | Öffentliche URL der Login-Seite hinter einem Proxy |
 | `WODIS_OPEN_BROWSER` | `1` | `0` öffnet die Login-Seite nicht automatisch |
 | `WODIS_DEBUG` | – | `1` protokolliert die Login-Schritte. Seitentitel und Feldnamen, nie Werte |
+| `WODIS_ALLOW_WRITE` | – | `1` schaltet schreibende Tools frei (`wodis_create_kontakt`) |
+| `WODIS_WRITE_DATABASES` | – | Kommagetrennte Datenbanken, in denen geschrieben werden darf, z. B. `1234567_FIRMA_EDU`. Leer = Schreiben immer abgelehnt |
+| `WODIS_ALLOW_SELF_UPDATE` | – | `1` schaltet das Tool `wodis_self_update` frei |
+
+## Schreiben (optional)
+
+Standardmäßig ist der Server rein lesend. Schreibende Tools gibt es nur, wenn **beides** gesetzt ist:
+
+1. `WODIS_ALLOW_WRITE=1`, sonst existiert das Tool gar nicht.
+2. `WODIS_WRITE_DATABASES` mit der Datenbank der aktuellen Sitzung (z. B. `1234567_FIRMA_EDU`). Steht sie
+   nicht in der Liste, wird abgelehnt. Wer wirklich in die Produktivdatenbank schreiben will, muss deren
+   Namen also ausdrücklich eintragen.
+
+### `wodis_create_kontakt`
+
+Legt eine natürliche Person an, genau wie die Oberfläche unter *Kontakte → Neu → Natürliche Person*
+(aufgezeichnet und 1:1 nachgebaut):
+
+1. Dubletten-Prüfung: `GET /geschaeftspartner/private/kontakte-kontaktdupletten?name=…&vorname=…`.
+   Bei Treffern wird **nicht** angelegt, außer der Aufruf setzt `trotzDublette: true`, und das nur nach
+   Rückfrage beim Benutzer.
+2. Anlegen: `POST /geschaeftspartner/private/kontakte-naturlich` im Mandanten 0
+   („mandantenunabhängig“). Pflicht sind nur Anrede und Nachname. Antwort `201` mit neuer ID.
+3. Zurücklesen: `GET /geschaeftspartner/private/kontakte-naturlich/{id}`. Liefert Kontaktnummer und
+   Briefanrede.
+
+Parameter: `anrede` (`Herr`, `Frau`, `Leer`, `DamenUndHerren`, `Familie`, `Eheleute`, `WG`, `HerrUndFrau`),
+`name`, optional `vorname` und `titel`, außerdem `confirm: true` als Pflicht. Löschen kann der Server
+bewusst nicht.
 
 ## Sicherheit
 
-* Die Datenwerkzeuge nutzen nur `GET`. Der einzige `POST` außerhalb des Logins ist die
-  Token-Erneuerung bei Keycloak.
+* Ohne `WODIS_ALLOW_WRITE=1` nutzen die Datenwerkzeuge nur `GET`. Der einzige `POST` außerhalb des Logins
+  ist dann die Token-Erneuerung bei Keycloak.
+* Schreibende Anfragen werden bei Serverfehlern **nicht** automatisch wiederholt, damit keine doppelten
+  Datensätze entstehen.
 * Werden Passwörter im Chat übergeben, landen sie im Modell und im Gesprächsverlauf. Besser sind die
   Login-Seite, das Terminal oder Umgebungsvariablen.
 * `session.json` enthält gültige Zugangsdaten zu echten Mieterdaten. Die Datei gehört **nie** in Git,

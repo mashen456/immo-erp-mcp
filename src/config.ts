@@ -41,6 +41,10 @@ export interface AppConfig {
   debug: boolean;
   /** Exposes the wodis_self_update tool (pulls and builds code from the git remote). Off by default. */
   allowSelfUpdate: boolean;
+  /** Exposes write tools (e.g. wodis_create_kontakt). Off by default. */
+  allowWrite: boolean;
+  /** Databases (e.g. "1234567_FIRMA_EDU") in which writes are allowed. Empty = writes always refused. */
+  writeDatabases: string[];
 }
 
 const env = (k: string): string | undefined => {
@@ -76,6 +80,11 @@ export function loadConfig(): AppConfig {
     locale: env('WODIS_LOCALE') ?? 'de',
     debug: env('WODIS_DEBUG') === '1',
     allowSelfUpdate: env('WODIS_ALLOW_SELF_UPDATE') === '1',
+    allowWrite: env('WODIS_ALLOW_WRITE') === '1',
+    writeDatabases: (env('WODIS_WRITE_DATABASES') ?? '')
+      .split(',')
+      .map((s) => s.trim().replace(/^yuneo_database:/i, ''))
+      .filter(Boolean),
   };
 }
 

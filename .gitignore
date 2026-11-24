@@ -21,3 +21,5 @@ capture/
 .npmrc
 # superseded output of the second reverse-api-engineer run (contains real sample data)
 scripts/aareon_objekte_search/
+# capture output of the contact-create run (contains the id/number of a real test record)
+scripts/kontakt_create_client/

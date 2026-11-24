@@ -3,6 +3,16 @@
 Neue Einträge oben. Nach jedem Update den MCP-Server neu starten. Die Login-Sitzung bleibt erhalten,
 sofern ein Eintrag nichts anderes sagt.
 
+## 0.4.0
+
+* Neu (optional, schreibend): `wodis_create_kontakt` legt eine natürliche Person an. Der Ablauf ist aus
+  der Oberfläche aufgezeichnet: Dubletten-Prüfung → `POST /kontakte-naturlich` → Zurücklesen. Die
+  Anfrage ist identisch mit der der Oberfläche (38 Felder).
+* Schutz: Das Tool gibt es nur mit `WODIS_ALLOW_WRITE=1`. Es schreibt nur in Datenbanken aus
+  `WODIS_WRITE_DATABASES`, braucht `confirm: true` und legt bei Dubletten nicht an (außer
+  `trotzDublette: true`). Schreibende Anfragen werden bei Serverfehlern nicht wiederholt.
+* Neu: `wodis_check_kontakt_dubletten` (nur lesend).
+
 ## 0.3.1
 
 * Doku: Die Sitzung hält sich selbst am Leben. Agenten sollen keine Cronjobs, Timer oder täglichen

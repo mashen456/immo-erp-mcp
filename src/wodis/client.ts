@@ -9,9 +9,10 @@
  *   - Mietverträge               -> /api/mietenbuchhaltung/private/mietvertraege
  *   - Kontakte / Mieter          -> /api/geschaeftspartner/private/kontakte(-naturlich|-juristisch)
  *
- * Every data call is an HTTP GET. The only non-GET request is the
- * OAuth refresh against Keycloak (<auth-host>), which does not
- * modify any business data.
+ * Reads are HTTP GET. The only writes are the explicit create methods
+ * (createKontaktNatuerlich → POST), which the MCP server exposes only when
+ * writing is enabled. The OAuth refresh against Keycloak (<auth-host>)
+ * does not modify any business data.
  *
  * Auth is read from a config object or from environment variables:
  *   WODIS_ACCESS_TOKEN   Bearer access token (JWT) – required unless a refresh token is given
@@ -67,6 +68,20 @@ const DEFAULTS = {
 
 /** Server-side maximum for $top (larger values return HTTP 413). */
 export const MAX_PAGE_SIZE = 50;
+
+/** Anrede values accepted by the contact API (enum of the SPA). */
+export const ANREDEN = ['Herr', 'Frau', 'Leer', 'DamenUndHerren', 'Familie', 'Eheleute', 'WG', 'HerrUndFrau'] as const;
+export type Anrede = (typeof ANREDEN)[number];
+
+export interface CreateKontaktNatuerlichInput {
+  anrede: Anrede;
+  /** Nachname (Pflicht) */
+  name: string;
+  vorname?: string | null;
+  titel?: string | null;
+  nameZusatz1?: string | null;
+  nameZusatz2?: string | null;
+}
 
 /** Fixed id of the "MIBU" (Mietenbuchhaltung) Buchhaltung – same in every tenant, also hardcoded in the SPA. */
 export const BUCHHALTUNG_MIETENBUCHHALTUNG_ID = '8f638646-6ce5-4002-9926-d218b4e9f214';
@@ -857,7 +872,7 @@ export class WodisYuneoClient {
     }
   }
 
-  // ---- transport (GET only) ----------------------------------------------
+  // ---- transport ----------------------------------------------------------
 
   private buildUrl(path: string, params?: Record<string, string | number | undefined>): string {
     const qs: string[] = [];
@@ -869,7 +884,46 @@ export class WodisYuneoClient {
     return `${this.baseUrl}/api${path}${qs.length ? `?${qs.join('&')}` : ''}`;
   }
 
-  /** Low-level GET. Read-only by construction: no other HTTP verbs are exposed. */
+  /**
+   * Low-level POST for create calls. Deliberately NO automatic retry on 429/5xx: a create is not
+   * idempotent and a retry could produce a duplicate record. Only a 401/403 (request rejected before
+   * processing, token expired) is retried once with a fresh token.
+   */
+  async postCreate<T>(path: string, body: unknown): Promise<{ status: number; data: T; location: string | null; etag: string | null }> {
+    let bearer = this.tokenProvider ? await this.tokenProvider(false) : (await this.ensureFreshToken(), this.accessToken);
+    const url = this.buildUrl(path);
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+          authorization: `Bearer ${bearer}`,
+          locale_id: this.locale,
+          origin: this.baseUrl,
+          referer: `${this.baseUrl}/${this.locale}/kontakt`,
+          'user-agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      if ((res.status === 401 || res.status === 403) && attempt === 0 && this.tokenProvider) {
+        bearer = await this.tokenProvider(true);
+        continue;
+      }
+      const text = await res.text();
+      if (!res.ok) throw new WodisApiError(res.status, url, text);
+      return {
+        status: res.status,
+        data: (text ? JSON.parse(text) : undefined) as T,
+        location: res.headers.get('location'),
+        etag: res.headers.get('etag'),
+      };
+    }
+  }
+
+  /** Low-level GET. */
   async get<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {
     let bearer = this.tokenProvider ? await this.tokenProvider(false) : (await this.ensureFreshToken(), this.accessToken);
     const url = this.buildUrl(path, params);
@@ -1149,6 +1203,85 @@ export class WodisYuneoClient {
       if (e instanceof WodisApiError && e.status === 404) return this.getKontaktJuristisch(id);
       throw e;
     }
+  }
+
+  // ---- Kontakt anlegen (write) ------------------------------------------------
+
+  /** Duplicate check the UI runs right before saving a natural person (captured). */
+  checkKontaktDubletten(name: string, vorname?: string | null, top = 50): Promise<PagedResponse<KontaktSummary>> {
+    return this.get('/geschaeftspartner/private/kontakte-kontaktdupletten', {
+      name,
+      vorname: vorname || undefined,
+      $top: Math.min(top, MAX_PAGE_SIZE),
+    });
+  }
+
+  /** Exactly the body the UI POSTs to /kontakte-naturlich (captured 1:1; untouched fields null / [] / {}). */
+  static buildKontaktNatuerlichBody(input: CreateKontaktNatuerlichInput & { mandantId: Guid }): Record<string, unknown> {
+    return {
+      mandantId: input.mandantId,
+      name: input.name,
+      nameZusatz1: input.nameZusatz1 ?? null,
+      nameZusatz2: input.nameZusatz2 ?? null,
+      kontakttyp: 'NaturlichePerson',
+      kontaktgruppeIds: [],
+      anrede: input.anrede,
+      anredetext: null,
+      homepage: null,
+      telefonnummern: [],
+      emails: [],
+      adressen: [],
+      zugeordneteKontakte: [],
+      bankverbindungen: [],
+      geburtsdatum: null,
+      legitimationen: [],
+      staatsangehoerigkeit: null,
+      steuerNummer: null,
+      saemtlicheVornamen: null,
+      vorname: input.vorname ?? null,
+      titel: input.titel ?? null,
+      zweiteStaaatsangehoerigkeit: null, // sic – the API spells it with three "a"
+      familienstand: null,
+      geburtsname: null,
+      teilunbekanntesGeburtsdatumTag: null,
+      teilunbekanntesGeburtsdatumMonat: null,
+      teilunbekanntesGeburtsdatumJahr: null,
+      geburtsort: null,
+      kirchensteuerabzugsmerkmale: [],
+      zugeordneteWohnungsbestaende: [],
+      regiemitarbeiterEinstellung: { internerStundensatz: null, externerStundensatz: null, zugeordneteGewerke: [] },
+      finanzamt: {
+        finanzamtId: null,
+        bankverbindung: null,
+        steuerNummer: null,
+        steuerIdentifikationsnummer: null,
+        umsatzsteuerIdentifikationsnummer: null,
+        wirtschaftsIdentifikationsnummer: null,
+      },
+      versandElektronischerRechnungen: {},
+      merkmalszuordnungen: [],
+      steuerbefreiungen: [],
+      crmInformationen: { istZustimmungDokumentenupload: false },
+      ctiAnschluss: null,
+      schufaInfo: {},
+    };
+  }
+
+  /**
+   * Creates a natural-person contact exactly like the UI (POST /kontakte-naturlich, no If-Match;
+   * answer 201 with the new id as JSON string + Location + ETag). Callers must run the duplicate
+   * check first. The contact is created in the given Mandant (UI default: root Mandant 0).
+   */
+  async createKontaktNatuerlich(input: CreateKontaktNatuerlichInput & { mandantId: Guid }): Promise<{ id: Guid; etag: string | null }> {
+    if (!input.name?.trim()) throw new Error('name (Nachname) ist Pflicht');
+    if (!input.anrede) throw new Error('anrede ist Pflicht');
+    const r = await this.postCreate<string>(
+      '/geschaeftspartner/private/kontakte-naturlich',
+      WodisYuneoClient.buildKontaktNatuerlichBody(input),
+    );
+    const id = r.data ?? r.location?.split('/').pop();
+    if (!id) throw new Error(`Anlegen meldet ${r.status}, aber keine ID.`);
+    return { id, etag: r.etag };
   }
 
   // ---- convenience ---------------------------------------------------------

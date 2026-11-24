@@ -7,6 +7,7 @@ import {
   odataAnd,
   odataContains,
   odataEq,
+  ANREDEN,
   WodisApiError,
   WodisYuneoClient,
   type ListQuery,
@@ -509,4 +510,84 @@ export function registerTools(server: McpServer, tm: TokenManager, loginPage: Lo
     },
     async () => run(() => client.getMandanten()),
   );
+
+  // ---- Kontakt anlegen (write, guarded) ------------------------------------------------
+
+  server.registerTool(
+    'wodis_check_kontakt_dubletten',
+    {
+      title: 'Wodis: Dubletten-Prüfung Kontakt',
+      description: 'Prüft wie die Oberfläche vor dem Anlegen, ob es schon Kontakte mit diesem Namen (und Vornamen) gibt. Nur lesend.',
+      inputSchema: { name: z.string().min(1).describe('Nachname'), vorname: z.string().optional() },
+      annotations: READ,
+    },
+    async ({ name, vorname }) =>
+      run(async () => {
+        const r = await client.checkKontaktDubletten(name, vorname);
+        return { anzahl: r.page.items.length, treffer: r.page.items };
+      }),
+  );
+
+  if (tm.cfg.allowWrite) {
+    server.registerTool(
+      'wodis_create_kontakt',
+      {
+        title: 'Wodis: Kontakt anlegen (schreibend)',
+        description:
+          'Legt einen neuen Kontakt (natürliche Person) an – SCHREIBT in die Datenbank. Nur nach ausdrücklicher Bitte des Benutzers verwenden ' +
+          'und vorher Anrede/Vorname/Name mit ihm bestätigen. Führt wie die Oberfläche zuerst die Dubletten-Prüfung aus: gibt es Treffer, wird ' +
+          'NICHT angelegt (außer trotzDublette=true nach Rückfrage). Nur in den per WODIS_WRITE_DATABASES freigegebenen Datenbanken.',
+        inputSchema: {
+          anrede: z.enum(ANREDEN).describe('z. B. "Herr" oder "Frau"'),
+          name: z.string().min(1).describe('Nachname (Pflicht)'),
+          vorname: z.string().optional(),
+          titel: z.string().optional().describe('z. B. "Dr."'),
+          confirm: z.literal(true).describe('Muss true sein – der Benutzer hat das Anlegen ausdrücklich bestätigt'),
+          trotzDublette: z.boolean().optional().describe('true = auch anlegen, wenn die Dubletten-Prüfung Treffer hat (nur nach Rückfrage)'),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      },
+      async (a) =>
+        run(async () => {
+          // 1) guard: only in explicitly allowed databases
+          const st = await tm.currentStatus();
+          const db = (st.database ?? '').toLowerCase();
+          if (!db || !tm.cfg.writeDatabases.some((w) => w.toLowerCase() === db)) {
+            return `Nicht angelegt: Schreiben ist in der Datenbank "${st.database ?? 'unbekannt'}" nicht freigegeben ` +
+              `(WODIS_WRITE_DATABASES=${tm.cfg.writeDatabases.join(',') || '(leer)'}).`;
+          }
+          // 2) duplicate check like the UI
+          const dup = await client.checkKontaktDubletten(a.name, a.vorname);
+          if (dup.page.items.length > 0 && !a.trotzDublette) {
+            return {
+              angelegt: false,
+              grund: 'Dubletten-Prüfung hat Treffer – nichts angelegt. Mit trotzDublette=true erneut aufrufen, wenn der Benutzer es trotzdem will.',
+              dubletten: dup.page.items,
+            };
+          }
+          // 3) create in the root Mandant (UI default "0 - mandantenunabhängig")
+          const root = (await client.getMandanten()).find((m) => m.istRootMandant || m.nummer === 0);
+          if (!root) throw new Error('Root-Mandant (0) nicht gefunden.');
+          const { id } = await client.createKontaktNatuerlich({
+            anrede: a.anrede,
+            name: a.name,
+            vorname: a.vorname,
+            titel: a.titel,
+            mandantId: root.id,
+          });
+          // 4) read back
+          const k = await client.getKontaktNatuerlich(id);
+          return {
+            angelegt: true,
+            datenbank: st.database,
+            id,
+            nummer: k.nummer,
+            bezeichnung: k.bezeichnung ?? `${k.name}${k.vorname ? `, ${k.vorname}` : ''}`,
+            anrede: k.anrede,
+            anredetext: k.anredetext,
+            dublettenIgnoriert: dup.page.items.length > 0 ? dup.page.items.length : undefined,
+          };
+        }),
+    );
+  }
 }
