@@ -1,0 +1,1201 @@
+/**
+ * immo-erp – READ-ONLY API client
+ *
+ * Covers:
+ *   - Wirtschaftseinheiten (WE)  -> /api/wohnungsbestand/private/wirtschaftseinheiten
+ *   - Objekte / Gebäude (OBJ)    -> /api/wohnungsbestand/private/objekte
+ *       incl. street search (?adresse=) = "Objekte" category of the global YuSearch
+ *   - Verwaltungseinheiten (VE)  -> /api/wohnungsbestand/private/verwaltungseinheiten  (Wohnungen, Gewerbe, Stellplätze)
+ *   - Mietverträge               -> /api/mietenbuchhaltung/private/mietvertraege
+ *   - Kontakte / Mieter          -> /api/geschaeftspartner/private/kontakte(-naturlich|-juristisch)
+ *
+ * Every data call is an HTTP GET. The only non-GET request is the
+ * OAuth refresh against Keycloak (<auth-host>), which does not
+ * modify any business data.
+ *
+ * Auth is read from a config object or from environment variables:
+ *   WODIS_ACCESS_TOKEN   Bearer access token (JWT) – required unless a refresh token is given
+ *   WODIS_REFRESH_TOKEN  Keycloak refresh token (optional; enables automatic renewal)
+ *   WODIS_COOKIE         Raw Cookie header (optional; not needed in testing)
+ *   WODIS_BASE_URL       default https://<erp-host>
+ *   WODIS_MANDANT        default mandant number(s) for list filters, e.g. "1040" or "1040,1010" (optional)
+ *
+ * Run: npm install && npx tsx api_client.ts
+ */
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+export interface WodisConfig {
+  /** Bearer access token (without the "Bearer " prefix). */
+  accessToken?: string;
+  /** Keycloak refresh token – enables automatic token renewal on expiry / 401. */
+  refreshToken?: string;
+  /** Optional raw Cookie header to forward. */
+  cookie?: string;
+  /** Base URL of the immo-erp web app. */
+  baseUrl?: string;
+  /** Keycloak realm token endpoint. */
+  tokenUrl?: string;
+  /** Public OAuth client id of the immo-erp SPA. */
+  clientId?: string;
+  /** UI locale sent as `locale_id` header (de/en). */
+  locale?: string;
+  /** Default `mandantNummern` filter applied to list endpoints (optional). */
+  mandantNummern?: number[];
+  /** Request timeout in ms. */
+  timeoutMs?: number;
+  /** Called after a successful token refresh (e.g. to persist new tokens). */
+  onTokenRefresh?: (tokens: TokenResponse) => void;
+}
+
+/** Public (non-secret) identifiers of the immo-erp SPA as seen in the OIDC flow. */
+const DEFAULTS = {
+  baseUrl: 'https://wodis-yuneo.de',
+  tokenUrl: 'https://auth.asw.aareon.com/realms/global/protocol/openid-connect/token',
+  clientId: '0A11C238-F6A8-4A27-9C35-7C95009A0304.apps.wodis-yuneo.aareon.com',
+  locale: 'de',
+  timeoutMs: 30_000,
+} as const;
+
+/** Server-side maximum for $top (larger values return HTTP 413). */
+export const MAX_PAGE_SIZE = 50;
+
+export function configFromEnv(overrides: WodisConfig = {}): WodisConfig {
+  const env = process.env;
+  const mandant = env.WODIS_MANDANT?.split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n));
+  return {
+    accessToken: env.WODIS_ACCESS_TOKEN?.replace(/^Bearer\s+/i, '') || undefined,
+    refreshToken: env.WODIS_REFRESH_TOKEN || undefined,
+    cookie: env.WODIS_COOKIE || undefined,
+    baseUrl: env.WODIS_BASE_URL || undefined,
+    mandantNummern: mandant && mandant.length ? mandant : undefined,
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+export type ISODateTime = string; // e.g. "2017-12-01T00:00:00"
+export type Guid = string;
+
+/** Generic reference object used everywhere in immo-erp ({id, kennung, bezeichnung}). */
+export interface Ref {
+  id: Guid;
+  kennung: string | null;
+  bezeichnung: string | null;
+}
+
+export interface Adresse {
+  strasse: string | null;
+  plz: string | null;
+  ort: string | null;
+  ortsteil: string | null;
+  laenderkennzeichen: string | null;
+}
+
+export interface Recht {
+  kennung: string;
+  standardRecht: string;
+  details: unknown;
+}
+
+export interface RechteSet {
+  rechte: Recht[];
+  keineRechte: Recht[];
+}
+
+/** Paging envelope returned by every list endpoint. */
+export interface Page<T> {
+  currentNumber: number;
+  size: number;
+  /** Number of pages (null when $skip is used). */
+  totalCount: number | null;
+  /** Total number of matching rows (null when $skip is used). */
+  totalItemsCount: number | null;
+  items: T[];
+}
+
+export interface PagedResponse<T> {
+  page: Page<T>;
+  authorizationDetails?: { mitRestriktion: boolean; grund: string | null };
+}
+
+export type Finanzierungsart =
+  | 'FreiFinanziert'
+  | 'OeffentlichGefoerdert'
+  | 'SteuerBeguenstigt'
+  | string;
+
+// ---- Mandanten ------------------------------------------------------------
+
+export interface Mandant {
+  id: Guid;
+  nummer: number;
+  bezeichnung: string;
+  verwaltungsart: 'Eigenverwaltung' | 'Fremdverwaltung' | string;
+  istTestmandant: boolean;
+  istRootMandant: boolean;
+  htmlFarbe: string | null;
+}
+
+// ---- Merkmale (customer-defined attributes, e.g. Zimmer, Nutzfläche) -------
+
+export interface MerkmalAuspraegung {
+  gueltigVon: ISODateTime | null;
+  auspraegungId: Guid | null;
+  auspraegungWert: string | null;
+}
+
+export interface Merkmalszuordnung {
+  merkmal: Ref;
+  merkmalsgruppen: Ref[];
+  traeger: string;
+  merkmalsTyp: 'Textuell' | 'Numerisch' | 'Datum' | 'Auswahl' | string;
+  auspraegungzuweisung: string;
+  isPflicht: boolean;
+  isNichtZeitabhaengig: boolean;
+  anzahlDezimalstellen: number | null;
+  /** (sic – API typo) */
+  auspraegegungszuordnungen: MerkmalAuspraegung[];
+  isAufsummiert: boolean;
+  beschreibung: string | null;
+}
+
+// ---- Wirtschaftseinheit ----------------------------------------------------
+
+export interface WirtschaftseinheitSummary {
+  id: Guid;
+  mandantId: Guid;
+  rechteSet?: RechteSet;
+  nummer: number;
+  bezeichnung: string;
+  zugang: ISODateTime | null;
+  abgang: ISODateTime | null;
+  vorgabeFinanzierungsart: Finanzierungsart;
+  flaechenSumme: number;
+  anzahlObjekte: number;
+  anzahlVerwaltungseinheiten: number;
+}
+
+export interface ObjektRef {
+  id: Guid;
+  nummer: number;
+  bezeichnung: string;
+  anzahlVerwaltungseinheiten: number;
+  adresse: Adresse;
+}
+
+export interface Wirtschaftseinheit extends WirtschaftseinheitSummary {
+  objekte: ObjektRef[];
+  lagebeschreibung: string | null;
+  eigentuemervertraege: unknown[];
+  merkmalszuordnungen: Merkmalszuordnung[];
+  [k: string]: unknown;
+}
+
+// ---- Objekt (Gebäude) ------------------------------------------------------
+
+export interface ObjektSummary {
+  id: Guid;
+  mandantId: Guid;
+  rechteSet?: RechteSet;
+  wirtschaftseinheitNummer: number;
+  nummer: number;
+  bezeichnung: string;
+  adresse: Adresse;
+  gebiet: string | null;
+  baujahr: number | null;
+  zugang: ISODateTime | null;
+  abgang: ISODateTime | null;
+  anzahlVerwaltungseinheiten: number;
+  flaechenSumme: number;
+  vorgabeFinanzierungsart: Finanzierungsart;
+}
+
+export interface Objekt extends ObjektSummary {
+  grundstuecksflaeche: number | null;
+  bebauteFlaeche: number | null;
+  gruenflaeche: number | null;
+  hofflaeche: number | null;
+  wirtschaftseinheit: Ref & { vorgabeFinanzierungsart: Finanzierungsart };
+  gemeinde: Ref | null;
+  objektbeschreibung: string | null;
+  merkmalszuordnungen: Merkmalszuordnung[];
+  verwaltungseinheiten?: VerwaltungseinheitRef[];
+  [k: string]: unknown;
+}
+
+/** Category / permission info of a immo-erp transaction, e.g. "MIBU-OBJEKT" (Objekte) or "MIBU-MIETVERTRAG". */
+export interface TransaktionInfo {
+  transaktion: { id: Guid; kennung: string; bezeichnung: string };
+  freischaltung: { istAktiv: boolean; grund: string | null; rechte: RechteSet };
+  optionen: { typ: string; istAktiv: boolean; grund: string | null }[];
+  mandantIds: Guid[];
+  entityTag?: { tag: string };
+}
+
+export interface VerwaltungseinheitRef {
+  id: Guid;
+  nummer: number;
+  bezeichnung: string;
+  etage: string | null;
+  lage: string | null;
+}
+
+// ---- Verwaltungseinheit (Einheit: Wohnung / Gewerbe / Stellplatz) ----------
+
+export interface VerwaltungseinheitSummary {
+  id: Guid;
+  mandantId: Guid;
+  rechteSet?: RechteSet;
+  wirtschaftseinheitNummer: number;
+  objektNummer: number;
+  nummer: number;
+  bezeichnung: string;
+  adresse: Adresse;
+  etage: string | null;
+  lage: string | null;
+  flaechenSumme: number;
+  zugang: ISODateTime | null;
+  abgang: ISODateTime | null;
+  aktuelleFinanzierungsart: Finanzierungsart | null;
+  /** e.g. {kennung:"1", bezeichnung:"Wohnraum"} / "gewerbliche Nutzung"; empty Ref when none. */
+  nutzungsart: Ref;
+  dynamischeSpalten: unknown[];
+}
+
+export interface FinanzierungsartZeitraum {
+  finanzierungsart: Finanzierungsart;
+  gueltigVon: ISODateTime | null;
+}
+
+export interface MietvertragKurz {
+  nutzungsart: string;
+  status: string; // "aktiv", ...
+  vertragsbeginn: ISODateTime | null;
+  vertragsende: ISODateTime | null;
+  id: Guid;
+  kennung: string;
+  bezeichnung: string;
+}
+
+export interface MietbestandteilZuordnung {
+  mietbestandteilsart: string;
+  mietbestandteil: Ref;
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  betrag: number;
+  betragProQuadratmeter: number | null;
+  mieteProQuadratmeter: number | null;
+  mietaenderungsgrund: Ref | null;
+  optierung: string;
+}
+
+export interface MietbestandteilGruppe {
+  mietbestandteilsart: string; // Grundmiete, Umlagevorauszahlungen, Heizkosten...
+  anzahlMietbestandteile: number;
+  betrag: number;
+  mietbestandteilsZuordnung: MietbestandteilZuordnung[];
+}
+
+export interface Istmiete {
+  kaltmieteProQuadratmeter: number;
+  betriebskostenvorauszahlungProQuadratmeter: number;
+  heizkostenvorauszahlungProQuadratmeter: number;
+  istmieteProQuadratmeter: number;
+  anzahlMietbestandteile: number;
+  mieteGesamt: number;
+  mietbestandteile: MietbestandteilGruppe[];
+}
+
+export interface Planmiete {
+  kaltmieteProQuadratmeter: number;
+  betriebskostenvorauszahlungProQuadratmeter: number;
+  heizkostenvorauszahlungProQuadratmeter: number;
+  planmieteProQuadratmeter: number;
+  veMaxMiete: number | null;
+  veMaxMieteProQuadratmeter: number | null;
+  geplanteKaution: number | null;
+  anzahlMietbestandteile: number;
+  mieteGesamt: number;
+  mietbestandteile: MietbestandteilGruppe[];
+}
+
+export interface Nichtvermietungsgrund {
+  gueltigVon?: ISODateTime | null;
+  gueltigBis?: ISODateTime | null;
+  [k: string]: unknown;
+}
+
+export interface Verwaltungseinheit {
+  id: Guid;
+  mandantId: Guid;
+  rechteSet?: RechteSet;
+  wirtschaftseinheitNummer: number;
+  objektNummer: number;
+  nummer: number;
+  bezeichnung: string;
+  adresse: Adresse;
+  etage: Ref | null;
+  lage: string | null;
+  /** Fläche in m² */
+  flaechenSumme: number;
+  zugang: ISODateTime | null;
+  abgang: ISODateTime | null;
+  finanzierungsarten: FinanzierungsartZeitraum[];
+  aktuelleFinanzierungsart: FinanzierungsartZeitraum | null;
+  wirtschaftseinheit: Ref;
+  objekt: Ref & { wirtschaftseinheitId: Guid; wirtschaftseinheitNummer: number };
+  erstbezug: ISODateTime | null;
+  bezugsfertigAb: ISODateTime | null;
+  aktuellerMietvertrag: MietvertragKurz | null;
+  aktuellerEigentuemervertrag: unknown | null;
+  aktuellerSondereigentuemervertrag: unknown | null;
+  nichtvermietungsgruende: Nichtvermietungsgrund[];
+  aktuellerNichtvermietungsgrund: Nichtvermietungsgrund | null;
+  kontakte: unknown[];
+  /** null for units without rent (e.g. some Stellplätze) */
+  istmiete: Istmiete | null;
+  planmiete: Planmiete | null;
+  zugeordneteFlaechen: unknown[];
+  ausstattungsbeschreibung: string | null;
+  merkmalszuordnungen: Merkmalszuordnung[];
+  [k: string]: unknown;
+}
+
+// ---- Mietvertrag -----------------------------------------------------------
+
+export type MietvertragStatus = 'Aktiv' | 'NichtMehrAktiv' | 'NochNichtAktiv' | string;
+
+export interface MietvertragSummary {
+  id: Guid;
+  rechteSet?: RechteSet;
+  mandantId: Guid;
+  bezeichnung: string; // tenant display name or "LEERSTAND"
+  nummer: number;
+  status: MietvertragStatus;
+  nutzungsart: string; // "Wohnraum", "gewerbliche Nutzung", ...
+  beginn: ISODateTime | null;
+  ende: ISODateTime | null;
+  kuendigungsdatum: ISODateTime | null;
+  kontakt: Ref | null;
+  wirtschaftseinheitNummer: number;
+  objektNummer: number;
+  verwaltungseinheitNummer: number;
+  adresse: Adresse;
+  wohnflaeche: number | null;
+  finanzierungsart: Finanzierungsart;
+  etage: string | null;
+  lage: string | null;
+  gesamtmiete: number;
+  saldo: number;
+  zahlungsart: string;
+  viban: string | null;
+  endToEndId: string | null;
+  sepaMandatVorhanden: boolean;
+  umlageart: string;
+  mietanpassung: string;
+  mahnstufe: number;
+  optierungsart: string;
+  traegerkennung: Ref | null;
+  bezugsfertigkeit: ISODateTime | null;
+  dynamischeSpalten: unknown[];
+}
+
+export interface KontaktKurz extends Ref {
+  geburtsdatum: ISODateTime | null;
+  endedatum: ISODateTime | null;
+  crmInformationen: Record<string, unknown> | null;
+  standardAdresse: (Ref & { adresse: Adresse; isStandard: boolean }) | null;
+  standardEmail: (Ref & { isStandard: boolean }) | null;
+  standardTelefon: (Ref & { isStandard: boolean }) | null;
+  bankverbindung: unknown | null;
+  kontaktart: 'NaturlichePerson' | 'JuristischePerson' | string;
+}
+
+export interface MietvertragVerwaltungseinheit extends Ref {
+  wirtschaftseinheit: Ref;
+  objekt: Ref;
+  verwaltungseinheit: Ref;
+  adresse: Adresse;
+  wohnflaeche: number | null;
+  finanzierungsart: Finanzierungsart;
+  etage: string | null;
+  lage: string | null;
+  /** "Vermietet" / "Leerstand" ... */
+  vermietungsstatus: string;
+  merkmal2Auspraegung: string | null;
+  merkmal3Auspraegung: string | null;
+  merkmal4Auspraegung: string | null;
+}
+
+/** Compact one-pager (side panel) – /mietvertraege/detail-mietvertrag/{id} */
+export interface MietvertragKompakt {
+  id: Guid;
+  mandantId: Guid;
+  bezeichnung: string;
+  nummer: number;
+  status: MietvertragStatus;
+  nutzungsart: Ref & { isOptierbar: boolean };
+  beginn: ISODateTime | null;
+  kuendigungZum: ISODateTime | null;
+  vertragsende: ISODateTime | null;
+  kontakte: { kontakt: KontaktKurz; rollen: string[] }[];
+  verwaltungseinheit: MietvertragVerwaltungseinheit;
+  mietstruktur: { mietbestandteil: Ref & { mietbestandteilsart: string | null }; betrag: number }[];
+  gesamtmieteMietstruktur: number;
+  saldo: number;
+  saldoZumBuchungsdatum: number;
+  zahlungsart: string;
+  endToEndId: string | null;
+  isSepaMandatVorhanden: boolean;
+  umlageart: string;
+  mietanpassungsart: string;
+  mahnstufe: number;
+  optierungsart: string;
+  [k: string]: unknown;
+}
+
+export interface Mietstrukturposition {
+  id: Guid;
+  mietbestandteilart: string;
+  mietbestandteil: Ref & { mietbestandteilsart: string | null };
+  isVe: boolean;
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  mietaenderungsgrund: Ref | null;
+  betrag: number;
+  mieteProQuadratmeter: number | null;
+  optierungsart: string;
+  mietbestandteilZuordnungstyp: string | null; // Kaltmiete, Betriebskostenvorauszahlung, ... (null e.g. for USt)
+  bemerkung: string | null;
+  istKautionsrelevant: boolean;
+  [k: string]: unknown;
+}
+
+export interface Rollenzuordnung {
+  rollentyp: string; // Mieter, Bewohner, Zahler, ...
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  bemerkung: string | null;
+  telefon: (Ref & { isStandard: boolean }) | null;
+  email: (Ref & { isStandard: boolean }) | null;
+  adresse: (Ref & { adresse: Adresse; isStandard: boolean }) | null;
+  inProzent: number | null;
+  kuendigungZum: ISODateTime | null;
+  [k: string]: unknown;
+}
+
+/** Full contract – /mietvertraege/{id} */
+export interface Mietvertrag {
+  id: Guid;
+  mandantId: Guid;
+  verwaltungseinheit: MietvertragVerwaltungseinheit;
+  bezeichnung: string;
+  nummer: number;
+  saldo: number;
+  saldoZumBuchungsdatum: number;
+  status: MietvertragStatus;
+  beginn: ISODateTime | null;
+  uebergabe: ISODateTime | null;
+  vertragsende: {
+    vertragsende: ISODateTime | null;
+    isVerlaengerungAktiviert: boolean;
+    verlaengerungstyp: string;
+    verlaengerungOptionen: unknown[];
+  };
+  kuendigung: {
+    kuendigungZum: ISODateTime | null;
+    kuendigungDurch: string | null;
+    tatsaechlicherAuszug: ISODateTime | null;
+    leerstandsgrund: Ref | null;
+    kuendigungsgruende: unknown[];
+    [k: string]: unknown;
+  };
+  nutzungsart: Ref & { isOptierbar: boolean };
+  optierungsart: string;
+  mieterart: string;
+  hauptmieter: KontaktKurz | null;
+  kontakte: { isHauptmieter: boolean; kontakt: KontaktKurz; rollenzuordnung: Rollenzuordnung[] }[];
+  leerstandsgrund: Ref | null;
+  gesamtmiete: {
+    kaltmieteProQuadratmeter: number;
+    betriebskostenvorauszahlungProQuadratmeter: number;
+    heizkostenvorauszahlungProQuadratmeter: number;
+    gesamtmieteProQuadratmeter: number;
+    gesamtmiete: number;
+    mietminderung: number;
+    anzahlMBE: number;
+    mietstruktur: Mietstrukturposition[];
+    [k: string]: unknown;
+  };
+  aktuelleUmlageart: { umlageart: string; gueltigAb: ISODateTime | null } | null;
+  sollstellungsrhytmus: string;
+  aktuelleZahlungsart: Record<string, unknown> | null;
+  endToEndId: string | null;
+  mahnstufe: number;
+  mietanpassungsart: string;
+  kautionsvertrag: Record<string, unknown>[];
+  [k: string]: unknown;
+}
+
+// ---- Kontakte --------------------------------------------------------------
+
+export type Kontakttyp = 'NaturlichePerson' | 'JuristischePerson' | string;
+
+export interface KontaktSummary {
+  id: Guid;
+  mandantId: Guid;
+  rechteSet?: RechteSet;
+  nummer: number;
+  kontakttyp: Kontakttyp;
+  bezeichnung: string;
+  nameZusatz1: string | null;
+  nameZusatz2: string | null;
+  adresse: string | null;
+  land: string | null;
+  telefonnummer: string | null;
+  geburtsdatum: ISODateTime | null;
+  staatsangehoerigkeit: string | null;
+  geschaeftsbeziehungTypes: string[];
+  email: string | null;
+  dsgvoStatus: string;
+  crmStatus: string | null;
+  [k: string]: unknown;
+}
+
+export interface KontaktTelefon {
+  kategorie: Ref;
+  land: string | null;
+  telefonnummer: string;
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  notiz: string | null;
+  isStandard: boolean;
+}
+
+export interface KontaktEmail {
+  id: Guid;
+  kategorie: Ref;
+  email: string;
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  notiz: string | null;
+  isStandard: boolean;
+}
+
+export interface KontaktAdresse {
+  id: Guid;
+  kategorie: Ref;
+  land: string | null;
+  careOf: string | null;
+  strasse: string | null;
+  hausNr: string | null;
+  hausnummerzusatz: string | null;
+  plz: string | null;
+  ort: string | null;
+  ortsteil: string | null;
+  bundesland: string | null;
+  postfachPlz: string | null;
+  postfachNummer: string | null;
+  gueltigVon: ISODateTime | null;
+  gueltigBis: ISODateTime | null;
+  notiz: string | null;
+  isStandard: boolean;
+}
+
+export interface Geschaeftsbeziehung extends Ref {
+  typ: string; // Mieter, Kreditor, ...
+  mandantId: Guid | null;
+  verwaltungsart: string | null;
+  notiz: string | null;
+  isGueltig: boolean;
+}
+
+export interface Kontakt {
+  id: Guid;
+  mandantId: Guid;
+  nummer: number;
+  kontakttyp: Kontakttyp;
+  /** natural persons: "Name, Vorname"; absent for legal entities (use `name`) */
+  bezeichnung?: string;
+  name: string;
+  nameZusatz1: string | null;
+  nameZusatz2: string | null;
+  anrede: string | null;
+  anredetext: string | null;
+  homepage: string | null;
+  telefonnummern: KontaktTelefon[];
+  emails: KontaktEmail[];
+  adressen: KontaktAdresse[];
+  adresse: KontaktAdresse | null;
+  telefon: string | null;
+  email: string | null;
+  bankverbindungen: unknown[];
+  geschaeftsbeziehungen: Geschaeftsbeziehung[];
+  geschaeftsbeziehungtypen: string[];
+  merkmalszuordnungen: Merkmalszuordnung[];
+  dsgvoStatus: string;
+  /** legal entities only */
+  gruendungDatum?: ISODateTime | null;
+  /** natural persons only */
+  vorname?: string | null;
+  titel?: string | null;
+  geburtsdatum?: ISODateTime | null;
+  staatsangehoerigkeit?: string | null;
+  [k: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Query helpers (OData-ish)
+// ---------------------------------------------------------------------------
+
+export interface ListQuery {
+  /** Page size ($top). Default and maximum 50 (server limit). */
+  top?: number;
+  /** Offset ($skip). */
+  skip?: number;
+  /** e.g. "nummer desc" */
+  orderby?: string;
+  /** Raw OData $filter expression. Combine with helpers below. */
+  filter?: string;
+  /** Restrict to Mandanten (by number). Falls back to config.mandantNummern. */
+  mandantNummern?: number[];
+  /** Additional raw query params (e.g. { name: "'Mustermann'" }). */
+  extra?: Record<string, string | number>;
+}
+
+/** Escape a string literal for OData ('' doubling). */
+export const odataString = (v: string): string => `'${v.replace(/'/g, "''")}'`;
+
+/** Case-insensitive "contains" – the same expression the immo-erp UI search uses. */
+export const odataContains = (field: string, value: string): string =>
+  `(substringof(toupper(${field}),${odataString(value.toUpperCase())}) eq true)`;
+
+export const odataEq = (field: string, value: string | number | boolean): string =>
+  `(${field} eq ${typeof value === 'string' ? odataString(value) : String(value)})`;
+
+export const odataAnd = (...parts: (string | undefined | false)[]): string | undefined => {
+  const p = parts.filter((x): x is string => !!x);
+  return p.length ? `(${p.join(' and ')})` : undefined;
+};
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class WodisApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly url: string,
+    public readonly body: string,
+  ) {
+    super(`Wodis API ${status} for ${url}: ${body.slice(0, 300)}`);
+    this.name = 'WodisApiError';
+  }
+}
+
+export interface TokenResponse {
+  access_token: string;
+  expires_in: number;
+  refresh_token?: string;
+  refresh_expires_in?: number;
+  token_type: string;
+  id_token?: string;
+  scope?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+export class WodisYuneoClient {
+  private accessToken?: string;
+  private refreshToken?: string;
+  private readonly cookie?: string;
+  private readonly baseUrl: string;
+  private readonly tokenUrl: string;
+  private readonly clientId: string;
+  private readonly locale: string;
+  private readonly timeoutMs: number;
+  private readonly defaultMandanten?: number[];
+  private readonly onTokenRefresh?: (t: TokenResponse) => void;
+  private refreshing?: Promise<void>;
+  private mandantCache?: Mandant[];
+
+  constructor(config: WodisConfig = configFromEnv()) {
+    this.accessToken = config.accessToken;
+    this.refreshToken = config.refreshToken;
+    this.cookie = config.cookie;
+    this.baseUrl = (config.baseUrl ?? DEFAULTS.baseUrl).replace(/\/+$/, '');
+    this.tokenUrl = config.tokenUrl ?? DEFAULTS.tokenUrl;
+    this.clientId = config.clientId ?? DEFAULTS.clientId;
+    this.locale = config.locale ?? DEFAULTS.locale;
+    this.timeoutMs = config.timeoutMs ?? DEFAULTS.timeoutMs;
+    this.defaultMandanten = config.mandantNummern;
+    this.onTokenRefresh = config.onTokenRefresh;
+    if (!this.accessToken && !this.refreshToken) {
+      throw new Error(
+        'No credentials: set WODIS_ACCESS_TOKEN (and optionally WODIS_REFRESH_TOKEN) or pass accessToken/refreshToken in the config.',
+      );
+    }
+  }
+
+  // ---- auth ---------------------------------------------------------------
+
+  /** Seconds until the current access token expires (from the JWT `exp` claim). */
+  tokenSecondsRemaining(): number | undefined {
+    const exp = this.accessToken ? decodeJwtExp(this.accessToken) : undefined;
+    return exp === undefined ? undefined : exp - Math.floor(Date.now() / 1000);
+  }
+
+  /** Refresh the access token using the Keycloak refresh_token grant (public client). */
+  async refresh(): Promise<void> {
+    if (!this.refreshToken) {
+      throw new Error('Access token expired/rejected and no refresh token configured (WODIS_REFRESH_TOKEN).');
+    }
+    if (!this.refreshing) {
+      this.refreshing = (async () => {
+        const body = new URLSearchParams({
+          grant_type: 'refresh_token',
+          client_id: this.clientId,
+          refresh_token: this.refreshToken!,
+        });
+        const res = await fetch(this.tokenUrl, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            accept: 'application/json',
+            origin: this.baseUrl,
+          },
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        const text = await res.text();
+        if (!res.ok) throw new WodisApiError(res.status, this.tokenUrl, text);
+        const tok = JSON.parse(text) as TokenResponse;
+        this.accessToken = tok.access_token;
+        if (tok.refresh_token) this.refreshToken = tok.refresh_token;
+        this.onTokenRefresh?.(tok);
+      })().finally(() => {
+        this.refreshing = undefined;
+      });
+    }
+    return this.refreshing;
+  }
+
+  private async ensureFreshToken(): Promise<void> {
+    const remaining = this.tokenSecondsRemaining();
+    if ((!this.accessToken || (remaining !== undefined && remaining < 60)) && this.refreshToken) {
+      await this.refresh();
+    }
+  }
+
+  // ---- transport (GET only) ----------------------------------------------
+
+  private buildUrl(path: string, params?: Record<string, string | number | undefined>): string {
+    const qs: string[] = [];
+    for (const [k, v] of Object.entries(params ?? {})) {
+      if (v === undefined || v === '') continue;
+      // keep "$" in OData keys unencoded, like the web app does
+      qs.push(`${k}=${encodeURIComponent(String(v))}`);
+    }
+    return `${this.baseUrl}/api${path}${qs.length ? `?${qs.join('&')}` : ''}`;
+  }
+
+  /** Low-level GET. Read-only by construction: no other HTTP verbs are exposed. */
+  async get<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {
+    await this.ensureFreshToken();
+    const url = this.buildUrl(path, params);
+    for (let attempt = 0; ; attempt++) {
+      const headers: Record<string, string> = {
+        accept: 'application/json, text/plain, */*',
+        authorization: `Bearer ${this.accessToken}`,
+        'cache-control': 'no-cache',
+        locale_id: this.locale,
+        referer: `${this.baseUrl}/${this.locale}/cockpit`,
+        'user-agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36',
+      };
+      if (this.cookie) headers.cookie = this.cookie;
+      const res = await fetch(url, { method: 'GET', headers, signal: AbortSignal.timeout(this.timeoutMs) });
+      if ((res.status === 401 || res.status === 403) && attempt === 0 && this.refreshToken) {
+        await this.refresh();
+        continue;
+      }
+      if ((res.status === 429 || res.status >= 502) && attempt < 3) {
+        await sleep(500 * 2 ** attempt);
+        continue;
+      }
+      const text = await res.text();
+      if (!res.ok) throw new WodisApiError(res.status, url, text);
+      return (text ? JSON.parse(text) : undefined) as T;
+    }
+  }
+
+  private listParams(q: ListQuery = {}): Record<string, string | number | undefined> {
+    const mandanten = q.mandantNummern ?? this.defaultMandanten;
+    return {
+      ...(q.extra ?? {}),
+      mandantNummern: mandanten?.length ? mandanten.join(',') : undefined,
+      $filter: q.filter,
+      $orderby: q.orderby,
+      $skip: q.skip,
+      $top: Math.min(q.top ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE),
+    };
+  }
+
+  /**
+   * Async iterator over all rows of a list endpoint, using $top/$skip.
+   * `fetchPage` must be one of the list* methods bound to this client.
+   */
+  async *paginate<T>(
+    fetchPage: (q: ListQuery) => Promise<PagedResponse<T>>,
+    q: ListQuery = {},
+    maxItems = Infinity,
+  ): AsyncGenerator<T> {
+    const top = Math.min(q.top ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE);
+    let skip = q.skip ?? 0;
+    let yielded = 0;
+    while (yielded < maxItems) {
+      const res = await fetchPage({ ...q, top, skip });
+      const items = res.page.items;
+      for (const it of items) {
+        if (yielded++ >= maxItems) return;
+        yield it;
+      }
+      if (items.length < top) return;
+      skip += top;
+    }
+  }
+
+  // ---- Querschnitt / Stammdaten ------------------------------------------
+
+  /** Current user profile. */
+  getMe(): Promise<Record<string, unknown>> {
+    return this.get('/querschnitt/private/me');
+  }
+
+  /** All Mandanten the user can access (id <-> nummer mapping). */
+  async getMandanten(force = false): Promise<Mandant[]> {
+    if (!this.mandantCache || force) {
+      this.mandantCache = await this.get<Mandant[]>('/querschnitt/private/mandanteninfrastruktur');
+    }
+    return this.mandantCache;
+  }
+
+  async getMandantById(mandantId: Guid): Promise<Mandant | undefined> {
+    const all = await this.getMandanten();
+    return all.find((m) => m.id.toLowerCase() === mandantId.toLowerCase());
+  }
+
+  // ---- Wirtschaftseinheiten ----------------------------------------------
+
+  /** List Wirtschaftseinheiten. Filterable fields: nummer, bezeichnung, zugang, abgang, vorgabeFinanzierungsart ... */
+  listWirtschaftseinheiten(q: ListQuery = {}): Promise<PagedResponse<WirtschaftseinheitSummary>> {
+    return this.get('/wohnungsbestand/private/wirtschaftseinheiten', this.listParams(q));
+  }
+
+  /** Search Wirtschaftseinheiten by Bezeichnung (UI search box behaviour). */
+  searchWirtschaftseinheiten(text: string, q: ListQuery = {}): Promise<PagedResponse<WirtschaftseinheitSummary>> {
+    return this.listWirtschaftseinheiten({ ...q, filter: odataAnd(odataContains('bezeichnung', text), q.filter) });
+  }
+
+  getWirtschaftseinheit(id: Guid): Promise<Wirtschaftseinheit> {
+    return this.get(`/wohnungsbestand/private/wirtschaftseinheiten/${encodeURIComponent(id)}`);
+  }
+
+  /** Objekte (Gebäude) of one WE – page size 20, 1-based pageNumber. */
+  listWirtschaftseinheitObjekte(id: Guid, pageNumber = 1): Promise<PagedResponse<ObjektRef>> {
+    return this.get(`/wohnungsbestand/private/wirtschaftseinheiten/${encodeURIComponent(id)}/objekte`, { pageNumber });
+  }
+
+  // ---- Objekte -------------------------------------------------------------
+
+  /** List Objekte. Filterable e.g. by wirtschaftseinheitNummer, nummer, bezeichnung. */
+  listObjekte(q: ListQuery = {}): Promise<PagedResponse<ObjektSummary>> {
+    return this.get('/wohnungsbestand/private/objekte', this.listParams(q));
+  }
+
+  /**
+   * Street / address search – what the "Objekte" category of the global search (YuSearch) and the
+   * grid's "Suchbegriff eingeben" box send. Server-side "contains" on the address, e.g. "Muster".
+   * Combine with orderby ("bezeichnung asc", "adresse desc", ...) and top/skip for paging.
+   */
+  searchObjekteByAdresse(text: string, q: ListQuery = {}): Promise<PagedResponse<ObjektSummary>> {
+    return this.listObjekte({ ...q, extra: { ...(q.extra ?? {}), adresse: text } });
+  }
+
+  /** Search Objekte by Bezeichnung (e.g. "Beispielstadt, Musterstraße 17") – the UI's suggestion search. */
+  searchObjekte(text: string, q: ListQuery = {}): Promise<PagedResponse<ObjektSummary>> {
+    return this.listObjekte({ ...q, filter: odataAnd(odataContains('bezeichnung', text), q.filter) });
+  }
+
+  /** Category metadata and permissions of a transaction, e.g. getTransaktion('MIBU-OBJEKT'). */
+  getTransaktion(kennung: string): Promise<TransaktionInfo> {
+    return this.get(`/querschnitt/private/transaktionen/${encodeURIComponent(kennung)}`);
+  }
+
+  getObjekt(id: Guid): Promise<Objekt> {
+    return this.get(`/wohnungsbestand/private/objekte/${encodeURIComponent(id)}`);
+  }
+
+  /** Verwaltungseinheiten of one Objekt – page size 20, 1-based pageNumber. */
+  listObjektVerwaltungseinheiten(id: Guid, pageNumber = 1): Promise<PagedResponse<VerwaltungseinheitRef>> {
+    return this.get(`/wohnungsbestand/private/objekte/${encodeURIComponent(id)}/verwaltungseinheiten`, { pageNumber });
+  }
+
+  // ---- Verwaltungseinheiten (Einheiten) ----------------------------------
+
+  /** List VEs. Filterable by wirtschaftseinheitNummer, objektNummer, nummer, bezeichnung, etage, lage ... */
+  listVerwaltungseinheiten(q: ListQuery = {}): Promise<PagedResponse<VerwaltungseinheitSummary>> {
+    return this.get('/wohnungsbestand/private/verwaltungseinheiten', this.listParams(q));
+  }
+
+  /** VE detail incl. area, Etage/Lage, address, current contract, Ist-/Planmiete, Nichtvermietung, Merkmale. */
+  getVerwaltungseinheit(id: Guid): Promise<Verwaltungseinheit> {
+    return this.get(`/wohnungsbestand/private/verwaltungseinheiten/${encodeURIComponent(id)}`);
+  }
+
+  // ---- Mietverträge --------------------------------------------------------
+
+  /**
+   * List Mietverträge. Filterable fields: status ('Aktiv'|'NichtMehrAktiv'|...), bezeichnung,
+   * wirtschaftseinheitNummer, objektNummer, verwaltungseinheitNummer, nummer, beginn ...
+   * Note: GUID fields (mandantId, verwaltungseinheitId) cannot be filtered – use mandantNummern + numbers.
+   */
+  listMietvertraege(q: ListQuery = {}): Promise<PagedResponse<MietvertragSummary>> {
+    return this.get('/mietenbuchhaltung/private/mietvertraege', this.listParams(q));
+  }
+
+  searchMietvertraege(text: string, q: ListQuery = {}): Promise<PagedResponse<MietvertragSummary>> {
+    return this.listMietvertraege({ ...q, filter: odataAnd(odataContains('bezeichnung', text), q.filter) });
+  }
+
+  /**
+   * All Mietverträge (current + historical, incl. "LEERSTAND" vacancy contracts) of one VE.
+   * Resolves the Mandant number automatically from the VE's mandantId.
+   */
+  async listMietvertraegeForVerwaltungseinheit(
+    ve: Pick<Verwaltungseinheit, 'mandantId' | 'wirtschaftseinheitNummer' | 'objektNummer' | 'nummer'>,
+    q: ListQuery = {},
+  ): Promise<PagedResponse<MietvertragSummary>> {
+    const mandant = await this.getMandantById(ve.mandantId);
+    return this.listMietvertraege({
+      orderby: 'beginn desc',
+      ...q,
+      mandantNummern: mandant ? [mandant.nummer] : q.mandantNummern,
+      filter: odataAnd(
+        odataEq('wirtschaftseinheitNummer', ve.wirtschaftseinheitNummer),
+        odataEq('objektNummer', ve.objektNummer),
+        odataEq('verwaltungseinheitNummer', ve.nummer),
+        q.filter,
+      ),
+    });
+  }
+
+  /** Full contract (Mietstruktur with validity, Kündigung, Kontakte+Rollen, Kaution, Zahlungsart …). */
+  getMietvertrag(id: Guid): Promise<Mietvertrag> {
+    return this.get(`/mietenbuchhaltung/private/mietvertraege/${encodeURIComponent(id)}`);
+  }
+
+  /** Compact contract one-pager (current Mietstruktur, Saldo, Kontakte with standard email/phone). */
+  getMietvertragKompakt(id: Guid): Promise<MietvertragKompakt> {
+    return this.get(`/mietenbuchhaltung/private/mietvertraege/detail-mietvertrag/${encodeURIComponent(id)}`);
+  }
+
+  // ---- Kontakte / Mieter --------------------------------------------------
+
+  /** List Kontakte. Filterable by bezeichnung, nummer, kontakttyp ... */
+  listKontakte(q: ListQuery = {}): Promise<PagedResponse<KontaktSummary>> {
+    return this.get('/geschaeftspartner/private/kontakte', this.listParams(q));
+  }
+
+  searchKontakte(text: string, q: ListQuery = {}): Promise<PagedResponse<KontaktSummary>> {
+    return this.listKontakte({ ...q, filter: odataAnd(odataContains('bezeichnung', text), q.filter) });
+  }
+
+  /** Natural person detail (Mieter). */
+  getKontaktNatuerlich(id: Guid): Promise<Kontakt> {
+    return this.get(`/geschaeftspartner/private/kontakte-naturlich/${encodeURIComponent(id)}`);
+  }
+
+  /** Legal entity detail (Firma). */
+  getKontaktJuristisch(id: Guid): Promise<Kontakt> {
+    return this.get(`/geschaeftspartner/private/kontakte-juristisch/${encodeURIComponent(id)}`);
+  }
+
+  /** Contact detail – picks the right endpoint from kontakttyp, or tries both. */
+  async getKontakt(id: Guid, kontakttyp?: Kontakttyp): Promise<Kontakt> {
+    if (kontakttyp === 'NaturlichePerson') return this.getKontaktNatuerlich(id);
+    if (kontakttyp === 'JuristischePerson') return this.getKontaktJuristisch(id);
+    try {
+      return await this.getKontaktNatuerlich(id);
+    } catch (e) {
+      if (e instanceof WodisApiError && e.status === 404) return this.getKontaktJuristisch(id);
+      throw e;
+    }
+  }
+
+  // ---- convenience ---------------------------------------------------------
+
+  /** Leerstand/vacancy heuristic for a VE detail. */
+  static vermietungsstatus(ve: Verwaltungseinheit): 'vermietet' | 'leerstand' | 'unbekannt' {
+    const mv = ve.aktuellerMietvertrag;
+    if (ve.aktuellerNichtvermietungsgrund) return 'leerstand';
+    if (!mv) return 'leerstand';
+    if (/leerstand/i.test(mv.bezeichnung)) return 'leerstand';
+    if (/aktiv/i.test(mv.status)) return 'vermietet';
+    return 'unbekannt';
+  }
+
+  /** Flatten Merkmale to {bezeichnung: latest value}. Useful for "Zimmer", "Nutzfläche" etc. */
+  static merkmaleAsRecord(m: Merkmalszuordnung[] | undefined): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (const z of m ?? []) {
+      const latest = [...(z.auspraegegungszuordnungen ?? [])].sort((a, b) =>
+        String(b.gueltigVon ?? '').localeCompare(String(a.gueltigVon ?? '')),
+      )[0];
+      if (z.merkmal?.bezeichnung) out[z.merkmal.bezeichnung] = latest?.auspraegungWert ?? null;
+    }
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// utils
+// ---------------------------------------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function decodeJwtExp(jwt: string): number | undefined {
+  try {
+    const payload = jwt.split('.')[1];
+    if (!payload) return undefined;
+    const json = JSON.parse(Buffer.from(payload.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+    return typeof json.exp === 'number' ? json.exp : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Example usage
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const client = new WodisYuneoClient(configFromEnv());
+  const remaining = client.tokenSecondsRemaining();
+  if (remaining !== undefined) console.log(`Access token valid for ${Math.round(remaining / 60)} more minutes`);
+
+  const mandanten = await client.getMandanten();
+  console.log(`Mandanten: ${mandanten.length}`);
+
+  // 1. Properties: list, paginate, search
+  const weList = await client.listWirtschaftseinheiten({ top: 5, orderby: 'nummer asc' });
+  console.log(`\nWirtschaftseinheiten total: ${weList.page.totalItemsCount}`);
+  for (const we of weList.page.items) {
+    console.log(`  WE ${we.nummer} ${we.bezeichnung} – ${we.anzahlObjekte} OBJ / ${we.anzahlVerwaltungseinheiten} VE / ${we.flaechenSumme} m²`);
+  }
+  const page2 = await client.listWirtschaftseinheiten({ top: 5, skip: 5, orderby: 'nummer asc' });
+  console.log(`  page 2 (skip=5): ${page2.page.items.map((w) => w.nummer).join(', ')}`);
+
+  let count = 0;
+  for await (const _ of client.paginate((q) => client.listWirtschaftseinheiten(q), { top: 50 }, 120)) count++;
+  console.log(`  paginate() iterated ${count} WE (capped at 120)`);
+
+  // pick a WE that actually has buildings
+  const withObj = await client.listWirtschaftseinheiten({ top: 1, filter: '(anzahlObjekte gt 0)', orderby: 'nummer asc' });
+  const weSummary = withObj.page.items[0] ?? weList.page.items[0];
+  if (!weSummary) throw new Error('No Wirtschaftseinheit visible for this user');
+
+  const search = await client.searchWirtschaftseinheiten(weSummary.bezeichnung.split(/[ ,]/)[0] ?? '', { top: 3 });
+  console.log(`  search "${weSummary.bezeichnung.split(/[ ,]/)[0]}": ${search.page.totalItemsCount} hits`);
+
+  // WE detail with Gebäude
+  const we = await client.getWirtschaftseinheit(weSummary.id);
+  console.log(`\nWE ${we.nummer} "${we.bezeichnung}" – Objekte:`);
+  for (const o of we.objekte) console.log(`  OBJ ${o.nummer} ${o.bezeichnung} (${o.anzahlVerwaltungseinheiten} VE) – ${o.adresse.strasse}, ${o.adresse.plz} ${o.adresse.ort}`);
+  const objPage = await client.listWirtschaftseinheitObjekte(we.id);
+  console.log(`  /objekte sub-resource: ${objPage.page.totalItemsCount} items`);
+
+  const objRef = [...we.objekte].sort((a, b) => b.anzahlVerwaltungseinheiten - a.anzahlVerwaltungseinheiten)[0];
+  if (!objRef) return;
+  const obj = await client.getObjekt(objRef.id);
+  console.log(`\nOBJ ${obj.wirtschaftseinheitNummer}/${obj.nummer} Baujahr ${obj.baujahr}, ${obj.flaechenSumme} m²`);
+
+  // Global "Objekte" search: houses by street (CLI arg, or the street of this Objekt without house number)
+  const street = process.argv[2] ?? (obj.adresse.strasse ?? '').replace(/\s*\d.*$/, '');
+  const byStreet = await client.searchObjekteByAdresse(street, { top: 10, orderby: 'bezeichnung asc' });
+  console.log(`  Objekte-Suche adresse="${street}": ${byStreet.page.totalItemsCount} hit(s)`);
+  for (const o of byStreet.page.items) console.log(`    OBJ ${o.wirtschaftseinheitNummer}/${o.nummer} ${o.adresse.strasse}, ${o.adresse.plz} ${o.adresse.ort} (${o.anzahlVerwaltungseinheiten} VE)`);
+  const ves = await client.listObjektVerwaltungseinheiten(obj.id);
+  for (const v of ves.page.items) console.log(`  VE ${v.nummer} ${v.bezeichnung} (${v.etage ?? '-'}/${v.lage ?? '-'})`);
+
+  // Unit list with Nutzungsart (type)
+  const veList = await client.listVerwaltungseinheiten({
+    filter: odataAnd(odataEq('wirtschaftseinheitNummer', obj.wirtschaftseinheitNummer), odataEq('objektNummer', obj.nummer)),
+    mandantNummern: [(await client.getMandantById(obj.mandantId))?.nummer ?? 0].filter(Boolean),
+    top: 20,
+  });
+  console.log(`  VE list w/ Nutzungsart: ${veList.page.items.map((v) => `${v.nummer}:${v.nutzungsart?.bezeichnung ?? '-'}`).join(', ')}`);
+
+  // 2. Unit detail
+  if (!ves.page.items.length) return;
+  // prefer a rented unit for the demo
+  let ve = await client.getVerwaltungseinheit(ves.page.items[0]!.id);
+  for (const r of ves.page.items) {
+    const d = r === ves.page.items[0] ? ve : await client.getVerwaltungseinheit(r.id);
+    if (d.aktuellerMietvertrag && !/leerstand/i.test(d.aktuellerMietvertrag.bezeichnung)) { ve = d; break; }
+  }
+  console.log(`\nVE ${ve.wirtschaftseinheitNummer}/${ve.objektNummer}/${ve.nummer} "${ve.bezeichnung}"`);
+  console.log(`  Fläche ${ve.flaechenSumme} m², Etage ${ve.etage?.bezeichnung ?? '-'} ${ve.lage ?? ''}`);
+  console.log(`  Adresse ${ve.adresse.strasse}, ${ve.adresse.plz} ${ve.adresse.ort}`);
+  console.log(`  Status: ${WodisYuneoClient.vermietungsstatus(ve)}; Istmiete ${ve.istmiete?.mieteGesamt ?? "-"} € (${ve.istmiete?.istmieteProQuadratmeter ?? "-"} €/m²)`);
+  console.log(`  Merkmale: ${Object.keys(WodisYuneoClient.merkmaleAsRecord(ve.merkmalszuordnungen)).join(', ') || '-'}`);
+
+  // 3. Contracts + tenant
+  const mvs = await client.listMietvertraegeForVerwaltungseinheit(ve);
+  console.log(`\nMietverträge of VE: ${mvs.page.totalItemsCount}`);
+  for (const mv of mvs.page.items) {
+    console.log(`  MV ${mv.nummer} [${mv.status}] ${mv.nutzungsart} ${mv.beginn?.slice(0, 10)} – ${mv.ende?.slice(0, 10) ?? 'offen'}, Kündigung ${mv.kuendigungsdatum?.slice(0, 10) ?? '-'}`);
+  }
+
+  const mvId = ve.aktuellerMietvertrag?.id ?? mvs.page.items[0]?.id;
+  if (!mvId) return;
+  const mv = await client.getMietvertrag(mvId);
+  console.log(`\nMietvertrag ${mv.nummer}: ${mv.status}, Beginn ${mv.beginn?.slice(0, 10)}, Ende ${mv.vertragsende.vertragsende?.slice(0, 10) ?? 'offen'}`);
+  console.log(`  Gesamtmiete ${mv.gesamtmiete.gesamtmiete} €`);
+  for (const p of mv.gesamtmiete.mietstruktur) {
+    console.log(`    ${p.mietbestandteil.bezeichnung} (${p.mietbestandteilZuordnungstyp}) ${p.betrag} € ab ${p.gueltigVon?.slice(0, 10)}${p.gueltigBis ? ` bis ${p.gueltigBis.slice(0, 10)}` : ''}`);
+  }
+  const kompakt = await client.getMietvertragKompakt(mvId);
+  console.log(`  (kompakt) Vermietungsstatus VE: ${kompakt.verwaltungseinheit.vermietungsstatus}, Saldo ${kompakt.saldo}`);
+
+  const haupt = mv.hauptmieter ?? mv.kontakte[0]?.kontakt;
+  if (!haupt) return;
+  const kontakt = await client.getKontakt(haupt.id, haupt.kontaktart);
+  console.log(`\nMieter #${kontakt.nummer} (${kontakt.kontakttyp}): ${kontakt.anrede ?? ''} ${kontakt.bezeichnung ?? kontakt.name}`);
+  console.log(`  Telefon: ${kontakt.telefonnummern.map((t) => t.telefonnummer).join(', ') || '-'}`);
+  console.log(`  E-Mail:  ${kontakt.emails.map((e) => e.email).join(', ') || '-'}`);
+  console.log(`  Adressen: ${kontakt.adressen.length}, Geschäftsbeziehungen: ${kontakt.geschaeftsbeziehungen.map((g) => g.typ).join(', ')}`);
+
+  const ks = await client.searchKontakte(kontakt.name ?? kontakt.bezeichnung, { top: 5 });
+  console.log(`  searchKontakte("${kontakt.name}") -> ${ks.page.totalItemsCount} hits`);
+}
+
+const isMain = import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith('api_client.ts');
+if (isMain) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

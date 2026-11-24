@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.*
+# session files must never be committed
+session.json
+*.session.json
+.wodis-mcp/
+
+# never commit captures, logs, chat/agent state or keys
+.claude/
+*.log
+*.jsonl
+*.har
+*.ndjson
+*.network-response
+capture/
+*.pem
+*.key
+.npmrc
+# superseded output of the second reverse-api-engineer run (contains real sample data)
+scripts/aareon_objekte_search/

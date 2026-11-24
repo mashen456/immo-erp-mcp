@@ -1,0 +1,19 @@
+{
+  "name": "wodis-yuneo-readonly-client",
+  "version": "1.0.0",
+  "description": "Read-only TypeScript client for Aareon Wodis Yuneo (Wirtschaftseinheiten, Objekte, Verwaltungseinheiten, Mietverträge, Kontakte)",
+  "type": "module",
+  "main": "api_client.ts",
+  "scripts": {
+    "start": "tsx api_client.ts",
+    "typecheck": "tsc --noEmit --strict --target es2022 --module nodenext --moduleResolution nodenext --skipLibCheck api_client.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
