@@ -26,6 +26,7 @@ const VERSION = version();
 const INSTRUCTIONS = `Read-only access to Aareon Wodis Yuneo (property management): Objekte (houses by street), Wirtschaftseinheiten, Einheiten (units), Mietverträge and Kontakte (tenants).
 Start with wodis_auth_status. If not logged in: call wodis_login (uses configured credentials if no parameters), then ask the user for the current 6-digit code from their authenticator app and call wodis_login_otp. If the user prefers not to share the password in chat, use wodis_login_page instead.
 Typical path: wodis_search_objekte(strasse) -> wodis_get_objekt(id) -> wodis_get_einheit(id) -> wodis_get_mietvertrag(aktuellerMietvertrag.id) -> wodis_get_kontakt(hauptmieter.id).
+Rent account (Mietkonto, Kontobewegungen, Rückstand/Guthaben): wodis_get_mietkonto(mietvertragId). Saldo = Soll − Haben: positive = arrears, negative = tenant credit.
 Results contain personal data of tenants; only show what the user asked for.
 Updates: wodis_server_info(checkForUpdates=true) lists new commits. Update with "npm run self-update" in the install directory (or wodis_self_update if enabled), then restart/reconnect this MCP server. The login session survives updates.`;
 

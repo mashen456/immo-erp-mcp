@@ -113,11 +113,12 @@ die Tokens. Details zum erfassten Ablauf stehen in [scripts/wodis_client/AUTH.md
 | `wodis_search_einheiten`, `wodis_get_einheit` | Einheiten inkl. Vermietungsstatus, Ist-/Planmiete und Leerstand |
 | `wodis_list_einheit_mietvertraege` | Alle Verträge einer Einheit |
 | `wodis_get_mietvertrag`, `wodis_search_mietvertraege` | Mietverträge mit Mietstruktur, Kündigung und Kaution |
+| `wodis_get_mietkonto` | Mietkonto eines Vertrags: Kontobewegungen (Sollstellungen, Zahlungen, Storni) mit laufendem Saldo und Summen. Positiver Saldo = Rückstand, negativer Saldo = Guthaben |
 | `wodis_search_kontakte`, `wodis_get_kontakt` | Mieter und Firmen mit Kontaktdaten |
 | `wodis_list_mandanten` | Mandanten |
 
 Typischer Ablauf: `wodis_search_objekte(strasse)` → `wodis_get_objekt` → `wodis_get_einheit` →
-`wodis_get_mietvertrag` → `wodis_get_kontakt`.
+`wodis_get_mietvertrag` → `wodis_get_kontakt`, für Zahlungen und Rückstände `wodis_get_mietkonto`.
 
 ## Konfiguration (Umgebungsvariablen)
 

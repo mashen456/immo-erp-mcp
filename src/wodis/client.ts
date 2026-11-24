@@ -68,6 +68,58 @@ const DEFAULTS = {
 /** Server-side maximum for $top (larger values return HTTP 413). */
 export const MAX_PAGE_SIZE = 50;
 
+/** Fixed id of the "MIBU" (Mietenbuchhaltung) Buchhaltung – same in every tenant, also hardcoded in the SPA. */
+export const BUCHHALTUNG_MIETENBUCHHALTUNG_ID = '8f638646-6ce5-4002-9926-d218b4e9f214';
+
+/** Account entry from /buchungswesen/private/kontenanzeigen/compact-konten. */
+export interface MietkontoKonto {
+  id: string;
+  kennung: string | null;
+  bezeichnung: string | null;
+  /** "Mieterkonto" for tenant accounts */
+  art: string;
+  relatedDetails?: { id: string }[];
+  gliederung?: unknown;
+}
+
+/** One account movement (Kontobewegung) of a Mietkonto. */
+export interface MietkontoBewegung {
+  id: string;
+  buchungsstatus: string; // "Endgueltig" | "Vorlaeufig" | ...
+  belegnummer: string | null; // e.g. "SOL 1234" (Sollstellung), "MZV 5678" (Zahlungsverkehr)
+  belegdatum: string | null;
+  buchungsdatum: string;
+  buchungstext: string | null;
+  teilbuchungstext: string | null; // e.g. remittance info of a payment
+  gegenkonto: string | null;
+  sollHabenKennzeichen: 'Soll' | 'Haben' | string;
+  betrag: number;
+  betragSoll: number;
+  betragHaben: number;
+  /**
+   * running balance after this booking within the requested period (Soll − Haben:
+   * positive = tenant is in arrears, negative = tenant credit). Only correct for descending order.
+   */
+  saldobetrag: number;
+  erfassungsdatum: string | null;
+  buchungsart: unknown;
+  ustKennung: unknown;
+  [k: string]: unknown;
+}
+
+/** Response of kontenanzeigen-mietenbuchhaltung-auskunft. */
+export interface MietkontoAuskunft extends PagedResponse<MietkontoBewegung> {
+  details: {
+    anzahlBewegungen: number;
+    summeSoll: number;
+    summeHaben: number;
+    /** saldo of the requested period = summeSoll − summeHaben (positive = arrears, negative = credit) */
+    summeSaldo: number;
+    buchungsseite: string;
+    [k: string]: unknown;
+  };
+}
+
 export function configFromEnv(overrides: WodisConfig = {}): WodisConfig {
   const env = process.env;
   const mandant = env.WODIS_MANDANT?.split(',')
@@ -1020,6 +1072,50 @@ export class WodisYuneoClient {
   /** Compact contract one-pager (current Mietstruktur, Saldo, Kontakte with standard email/phone). */
   getMietvertragKompakt(id: Guid): Promise<MietvertragKompakt> {
     return this.get(`/mietenbuchhaltung/private/mietvertraege/detail-mietvertrag/${encodeURIComponent(id)}`);
+  }
+
+  // ---- Mietkonto (Kontenanzeige Mietenbuchhaltung) ---------------------------
+
+  /**
+   * Account of a Mietvertrag in the Mietenbuchhaltung (UI: Kontenanzeige). For tenants the
+   * account id equals the Mietvertrag id and `art` is "Mieterkonto".
+   */
+  async getMietkontoKonto(mietvertragId: Guid, mandantNummer: number): Promise<MietkontoKonto | undefined> {
+    const r = await this.get<PagedResponse<MietkontoKonto>>('/buchungswesen/private/kontenanzeigen/compact-konten', {
+      compactType: 'Create',
+      mandantNummer,
+      buchhaltungId: BUCHHALTUNG_MIETENBUCHHALTUNG_ID,
+      vertragId: mietvertragId,
+    });
+    return r.page.items[0];
+  }
+
+  /**
+   * Account movements (Kontobewegungen) of a Mietvertrag: Sollstellungen, Zahlungen, Storni …
+   * `details` holds the sums for the requested period (summeSaldo = saldo of that period;
+   * from the contract start it equals the current account balance). Max 50 per page.
+   */
+  async getMietkontoBewegungen(
+    mietvertragId: Guid,
+    mandantNummer: number,
+    opts: { von?: string; bis?: string; top?: number; seite?: number; orderby?: string } = {},
+  ): Promise<MietkontoAuskunft> {
+    const konto = await this.getMietkontoKonto(mietvertragId, mandantNummer);
+    const top = Math.min(Math.max(opts.top ?? 25, 1), MAX_PAGE_SIZE);
+    const seite = Math.max(opts.seite ?? 1, 1);
+    return this.get('/buchungswesen/private/kontenanzeigen-mietenbuchhaltung-auskunft', {
+      mandantnummern: String(mandantNummer),
+      buchungsdatumVon: opts.von ?? '1900-01-01',
+      buchungsdatumBis: opts.bis ?? new Date().toISOString().slice(0, 10),
+      KontoId: konto?.relatedDetails?.[0]?.id ?? konto?.id ?? mietvertragId,
+      kontoArt: konto?.art ?? 'Mieterkonto',
+      isMietstornoFruehererJahreAusblenden: 'false',
+      isBekoAbrechnungBuchungenVerdichten: 'false',
+      $orderby: opts.orderby ?? 'buchungsdatum desc',
+      $top: top,
+      // the API converts $skip into a page number: it must be a multiple of $top
+      $skip: seite > 1 ? (seite - 1) * top : undefined,
+    });
   }
 
   // ---- Kontakte / Mieter --------------------------------------------------

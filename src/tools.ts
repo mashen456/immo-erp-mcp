@@ -361,6 +361,84 @@ export function registerTools(server: McpServer, tm: TokenManager, loginPage: Lo
   );
 
   server.registerTool(
+    'wodis_get_mietkonto',
+    {
+      title: 'Wodis: Mietkonto / Kontobewegungen',
+      description:
+        'Kontobewegungen des Mietkontos zu einem Mietvertrag (Sollstellungen, Zahlungseingänge, Storni, Gutschriften) mit laufendem Saldo, ' +
+        'neueste zuerst. Liefert außerdem Summen (Soll, Haben, Saldo) für den Zeitraum. Saldo = Soll − Haben: POSITIV = Rückstand/Forderung ' +
+        'gegenüber dem Mieter, NEGATIV = Guthaben des Mieters. Ohne "von" (ab Vertragsbeginn) entspricht saldoZeitraum dem aktuellen Kontostand. ' +
+        '"saldo" je Buchung ist der laufende Saldo nach der Buchung innerhalb des Zeitraums. Max. 50 Buchungen pro Seite, weiter mit "seite".',
+      inputSchema: {
+        mietvertragId: z.string().describe('Mietvertrag-ID (GUID), z. B. aus wodis_list_einheit_mietvertraege oder aktuellerMietvertrag.id'),
+        von: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Buchungsdatum ab (YYYY-MM-DD), Standard: alles'),
+        bis: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Buchungsdatum bis (YYYY-MM-DD), Standard: heute'),
+        top: z.number().int().min(1).max(50).optional().describe('Buchungen pro Seite (1–50, Standard 25)'),
+        seite: z.number().int().min(1).optional().describe('Seite (1 = neueste Buchungen)'),
+        aelteste_zuerst: z.boolean().optional().describe('true = chronologisch aufsteigend'),
+      },
+      annotations: READ,
+    },
+    async (a) =>
+      run(async () => {
+        const mv = (await client.getMietvertragKompakt(a.mietvertragId)) as unknown as {
+          mandantId: string;
+          nummer?: number;
+          bezeichnung?: string;
+          saldo?: number;
+        };
+        const mandant = await client.getMandantById(mv.mandantId);
+        if (!mandant) throw new Error(`Mandant ${mv.mandantId} des Mietvertrags nicht gefunden.`);
+        const top = a.top ?? 25;
+        const seite = a.seite ?? 1;
+        const r = await client.getMietkontoBewegungen(a.mietvertragId, mandant.nummer, {
+          von: a.von,
+          bis: a.bis,
+          top,
+          seite,
+          orderby: a.aelteste_zuerst ? 'buchungsdatum asc' : 'buchungsdatum desc',
+        });
+        // with $skip the API returns no totalItemsCount; details.anzahlBewegungen is always the period count
+        const total = r.details.anzahlBewegungen ?? r.page.totalItemsCount ?? 0;
+        const saldoText = (v: number | undefined) =>
+          v === undefined ? undefined : v > 0 ? `Rückstand ${v.toFixed(2)} €` : v < 0 ? `Guthaben ${(-v).toFixed(2)} €` : 'ausgeglichen';
+        return {
+          mietvertrag: {
+            nummer: mv.nummer,
+            bezeichnung: mv.bezeichnung,
+            saldoLautVertrag: mv.saldo,
+            kontostand: saldoText(mv.saldo),
+          },
+          zeitraum: { von: a.von ?? 'Beginn', bis: a.bis ?? new Date().toISOString().slice(0, 10) },
+          summen: {
+            anzahlBewegungen: r.details.anzahlBewegungen,
+            summeSoll: r.details.summeSoll,
+            summeHaben: r.details.summeHaben,
+            saldoZeitraum: r.details.summeSaldo,
+            saldoZeitraumText: saldoText(r.details.summeSaldo),
+          },
+          vorzeichen: 'Saldo = Soll − Haben; positiv = Rückstand des Mieters, negativ = Guthaben des Mieters',
+          seite,
+          proSeite: top,
+          hatWeitere: seite * top < total,
+          bewegungen: r.page.items.map((b) => ({
+            datum: b.buchungsdatum?.slice(0, 10),
+            beleg: b.belegnummer,
+            text: b.buchungstext,
+            detail: b.teilbuchungstext,
+            gegenkonto: b.gegenkonto,
+            soll: b.betragSoll || undefined,
+            haben: b.betragHaben || undefined,
+            // the API computes the running balance only correctly for descending order
+            saldo: a.aelteste_zuerst ? undefined : b.saldobetrag,
+            status: b.buchungsstatus !== 'Endgueltig' ? b.buchungsstatus : undefined,
+            buchungsart: b.buchungsart,
+          })),
+        };
+      }),
+  );
+
+  server.registerTool(
     'wodis_search_mietvertraege',
     {
       title: 'Wodis: Mietverträge suchen',

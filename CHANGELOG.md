@@ -3,6 +3,16 @@
 Neue Einträge oben. Nach jedem Update den MCP-Server neu starten. Die Login-Sitzung bleibt erhalten,
 sofern ein Eintrag nichts anderes sagt.
 
+## 0.3.0
+
+* Neu: Tool `wodis_get_mietkonto`. Es zeigt die Kontobewegungen des Mietkontos zu einem Mietvertrag
+  (Sollstellungen, Zahlungen, Storni) mit laufendem Saldo, Summen (Soll/Haben/Saldo), Zeitraumfilter
+  (`von`/`bis`) und Seiten (max. 50 je Seite).
+* Saldo = Soll − Haben: positiv bedeutet Rückstand des Mieters, negativ Guthaben. Das Tool gibt den
+  Kontostand zusätzlich als Text aus („Guthaben 120.00 €“).
+* API: `GET /buchungswesen/private/kontenanzeigen/compact-konten` (Konto zum Vertrag) und
+  `GET /buchungswesen/private/kontenanzeigen-mietenbuchhaltung-auskunft` (Bewegungen).
+
 ## 0.2.0
 
 * Neu: Update-Pfad über Git: `npm run self-update` bzw. `wodis-mcp update`
