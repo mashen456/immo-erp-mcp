@@ -1,6 +1,6 @@
 {
   "name": "wodis-mcp-inofficial",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-only MCP server for immo-erp (Objekte, Einheiten, Mietverträge, Kontakte) with Keycloak login incl. TOTP and long-lived sessions",
   "type": "module",
   "bin": {
@@ -16,7 +16,8 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "self-update": "node dist/index.js update"
   },
   "engines": {
     "node": ">=20"

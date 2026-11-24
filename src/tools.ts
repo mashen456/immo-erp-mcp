@@ -12,6 +12,7 @@ import {
   type ListQuery,
   type PagedResponse,
 } from './wodis/client.js';
+import { checkForUpdates, commit, repoRoot, selfUpdate, version } from './update.js';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
 
@@ -151,6 +152,55 @@ export function registerTools(server: McpServer, tm: TokenManager, loginPage: Lo
     },
     async () => run(async () => (await tm.logout(), 'Abgemeldet, Sitzung gelöscht.')),
   );
+
+  // ---- Server / Updates -------------------------------------------------------------
+
+  const runningVersion = `${version()} (${commit() ?? 'no git checkout'})`;
+
+  server.registerTool(
+    'wodis_server_info',
+    {
+      title: 'Wodis: Server-Version und Updates',
+      description:
+        'Zeigt die laufende Version des MCP-Servers. checkForUpdates=true holt den Stand des Git-Remotes (nur lesend) und listet neue Commits. ' +
+        'Update: im Installationsordner "npm run self-update" ausführen (oder wodis_self_update, falls freigeschaltet), danach den MCP-Server neu starten. Die Login-Sitzung bleibt erhalten.',
+      inputSchema: { checkForUpdates: z.boolean().optional() },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ checkForUpdates: check }) =>
+      run(async () => ({
+        running: runningVersion,
+        installDir: repoRoot,
+        selfUpdateToolEnabled: tm.cfg.allowSelfUpdate,
+        ...(check ? checkForUpdates() : { installed: `${version()} (${commit() ?? '?'})` }),
+      })),
+  );
+
+  if (tm.cfg.allowSelfUpdate) {
+    server.registerTool(
+      'wodis_self_update',
+      {
+        title: 'Wodis: Server aktualisieren',
+        description:
+          'Aktualisiert den MCP-Server aus dem Git-Remote (git pull --ff-only, npm ci, npm run build). Bricht bei lokalen Änderungen ab. ' +
+          'Danach muss der MCP-Client den Server neu starten/verbinden; die Login-Sitzung bleibt erhalten. Nur nach Rückfrage beim Benutzer aufrufen.',
+        inputSchema: { confirm: z.literal(true).describe('Muss true sein – Bestätigung, dass das Update gewollt ist') },
+        annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      },
+      async () =>
+        run(async () => {
+          const r = selfUpdate();
+          return {
+            ...r,
+            next: r.ok
+              ? r.restartRequired
+                ? 'Update installiert. Jetzt den MCP-Server neu starten/verbinden, damit die neue Version läuft.'
+                : 'Bereits aktuell, kein Neustart nötig.'
+              : 'Update fehlgeschlagen, alte Version läuft unverändert weiter.',
+          };
+        }),
+    );
+  }
 
   // ---- Bestand ------------------------------------------------------------------
 

@@ -8,6 +8,8 @@
  *   wodis-mcp status       show session status
  *   wodis-mcp keepalive    refresh once (for cron/launchd/systemd timers) – exit 1 if a login is needed
  *   wodis-mcp logout       end the session and delete stored tokens
+ *   wodis-mcp version      print version and git commit (--check: also list available updates)
+ *   wodis-mcp update       git pull --ff-only → npm ci → npm run build (then restart the MCP server)
  */
 import { createInterface } from 'node:readline';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -17,13 +19,15 @@ import { SessionStore } from './auth/session-store.js';
 import { TokenManager, type LoginStep } from './auth/token-manager.js';
 import { loadConfig, log } from './config.js';
 import { registerTools } from './tools.js';
+import { checkForUpdates, commit, selfUpdate, version } from './update.js';
 
-const VERSION = '0.1.0';
+const VERSION = version();
 
 const INSTRUCTIONS = `Read-only access to Aareon Wodis Yuneo (property management): Objekte (houses by street), Wirtschaftseinheiten, Einheiten (units), Mietverträge and Kontakte (tenants).
 Start with wodis_auth_status. If not logged in: call wodis_login (uses configured credentials if no parameters), then ask the user for the current 6-digit code from their authenticator app and call wodis_login_otp. If the user prefers not to share the password in chat, use wodis_login_page instead.
 Typical path: wodis_search_objekte(strasse) -> wodis_get_objekt(id) -> wodis_get_einheit(id) -> wodis_get_mietvertrag(aktuellerMietvertrag.id) -> wodis_get_kontakt(hauptmieter.id).
-Results contain personal data of tenants; only show what the user asked for.`;
+Results contain personal data of tenants; only show what the user asked for.
+Updates: wodis_server_info(checkForUpdates=true) lists new commits. Update with "npm run self-update" in the install directory (or wodis_self_update if enabled), then restart/reconnect this MCP server. The login session survives updates.`;
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -51,12 +55,26 @@ async function main(): Promise<void> {
       await tm.logout();
       console.log('Abgemeldet, Sitzung gelöscht.');
       return;
+    case 'version':
     case '--version':
     case '-v':
-      console.log(VERSION);
+      console.log(
+        process.argv.includes('--check') ? JSON.stringify(checkForUpdates(), null, 2) : `${VERSION} (${commit() ?? 'no git checkout'})`,
+      );
       return;
+    case 'update': {
+      const r = selfUpdate();
+      for (const s of r.steps) console.error(`${s.ok ? '✔' : '✘'} ${s.step}${s.ok ? '' : `\n${s.output}`}`);
+      console.log(
+        r.ok
+          ? `Update ${r.from} → ${r.to}.${r.restartRequired ? ' Bitte den MCP-Server neu starten/verbinden; die Sitzung bleibt erhalten.' : ' Bereits aktuell.'}`
+          : 'Update fehlgeschlagen.',
+      );
+      process.exitCode = r.ok ? 0 : 1;
+      return;
+    }
     default:
-      console.error('Usage: wodis-mcp [serve|login|login-page|status|keepalive|logout]');
+      console.error('Usage: wodis-mcp [serve|login|login-page|status|keepalive|logout|version [--check]|update]');
       process.exitCode = 2;
   }
 }

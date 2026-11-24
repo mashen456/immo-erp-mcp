@@ -39,6 +39,8 @@ export interface AppConfig {
   openBrowser: boolean;
   locale: string;
   debug: boolean;
+  /** Exposes the wodis_self_update tool (pulls and builds code from the git remote). Off by default. */
+  allowSelfUpdate: boolean;
 }
 
 const env = (k: string): string | undefined => {
@@ -73,6 +75,7 @@ export function loadConfig(): AppConfig {
     openBrowser: (env('WODIS_OPEN_BROWSER') ?? '1') !== '0',
     locale: env('WODIS_LOCALE') ?? 'de',
     debug: env('WODIS_DEBUG') === '1',
+    allowSelfUpdate: env('WODIS_ALLOW_SELF_UPDATE') === '1',
   };
 }
 

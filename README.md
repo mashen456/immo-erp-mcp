@@ -19,6 +19,27 @@ git clone <repo-url> wodis-mcp && cd wodis-mcp
 npm install          # baut automatisch nach dist/
 ```
 
+### Aktualisieren
+
+Updates kommen über Git. Die Login-Sitzung (`~/.wodis-mcp/session.json`) bleibt dabei erhalten, ein neuer
+Login ist **nicht** nötig.
+
+```bash
+cd /pfad/zu/wodis-mcp
+node dist/index.js version --check   # zeigt laufende Version und neue Commits
+npm run self-update                  # git pull --ff-only → npm ci → npm run build
+```
+
+Danach den MCP-Server im Client **neu starten bzw. neu verbinden**, damit die neue Version läuft.
+
+* Für Agenten: `wodis_server_info` mit `checkForUpdates: true` meldet, ob ein Update da ist. Was sich
+  geändert hat, steht in [CHANGELOG.md](CHANGELOG.md).
+* Agenten ohne Shell-Zugriff: Mit `WODIS_ALLOW_SELF_UPDATE=1` in der MCP-Konfiguration gibt es zusätzlich
+  das Tool `wodis_self_update`. Es ist standardmäßig aus, weil es Code aus dem Repository nachlädt.
+* `self-update` bricht ab, wenn im Installationsordner lokale Änderungen liegen. Es überschreibt nie
+  etwas stillschweigend. Für ein privates Repository braucht der Rechner Lesezugriff auf GitHub,
+  zum Beispiel über einen Deploy-Key.
+
 ### In Claude Code einbinden
 
 ```bash
