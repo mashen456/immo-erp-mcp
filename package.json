@@ -1,6 +1,6 @@
 {
   "name": "wodis-mcp-inofficial",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Read-only MCP server for immo-erp (Objekte, Einheiten, Mietverträge, Kontakte) with Keycloak login incl. TOTP and long-lived sessions",
   "type": "module",
   "bin": {

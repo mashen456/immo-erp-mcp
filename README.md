@@ -82,24 +82,38 @@ die Tokens. Details zum erfassten Ablauf stehen in [scripts/wodis_client/AUTH.md
 * „Angemeldet bleiben“ wird beim Login immer gesetzt.
 * Gespeichert werden Access- und Refresh-Token sowie die **Keycloak-SSO-Cookies**. Das Passwort wird
   **nie** gespeichert.
-* Solange der Server läuft, erneuert er den Token alle `WODIS_KEEPALIVE_MINUTES` (Standard 30). Der
-  Refresh-Token lebt 10 Stunden, wird bei jeder Erneuerung neu ausgestellt und hält die SSO-Sitzung aktiv.
-* Ist der Refresh-Token doch abgelaufen, zum Beispiel weil der Rechner aus war, meldet sich der Server mit
-  den gespeicherten SSO-Cookies **still neu an**, ohne Passwort und ohne Code.
-* Neu einloggen mit Code musst du dich erst, wenn die maximale SSO-Sitzungsdauer von Keycloak
-  abgelaufen ist. Beim Hersteller sind das **5 Tage** nach dem Login (`ssoSessionValidUntil` in
-  `wodis_auth_status`).
-* Läuft länger als etwa 10 Stunden gar nichts, zum Beispiel weil der Rechner über Nacht aus ist, kann
-  Keycloak die SSO-Sitzung vorher beenden. Ob das passiert, ist noch nicht geprüft. Ein Keepalive auf
-  einem Rechner, der immer läuft, verhindert das.
-* Damit die Sitzung auch ohne laufenden MCP-Client nicht abläuft, kannst du den Keepalive als Cronjob
-  einrichten:
+* Der Server hält die Sitzung **selbst** am Leben:
+  * **Beim Start** und **bei jeder Abfrage** prüft er die Tokens. Ein abgelaufener Access-Token wird per
+    Refresh-Token erneuert.
+  * Ist auch der Refresh-Token abgelaufen (10 Stunden), zum Beispiel weil der Rechner über Nacht aus war,
+    meldet sich der Server mit den gespeicherten SSO-Cookies **still neu an**, ohne Passwort und ohne Code.
+    Das macht der Browser genauso, wenn man die Seite am nächsten Morgen öffnet (getestet, etwa 0,7 Sekunden).
+  * Solange er läuft, erneuert er zusätzlich alle `WODIS_KEEPALIVE_MINUTES` (Standard 30). Das ist nur ein
+    Bonus und für das Angemeldet-Bleiben nicht nötig.
+* **Harte Grenze:** Die SSO-Sitzung des Herstellers endet **5 Tage** nach dem Login mit Code. Danach ist
+  einmal ein neuer Login mit Passwort und Code nötig. Das lässt sich durch kein Erneuern verlängern.
+  Wann es so weit ist, steht in `wodis_auth_status` als `ssoSessionValidUntil`.
 
-  ```cron
-  */30 * * * * /usr/bin/env node /pfad/zu/wodis-mcp/dist/index.js keepalive >/dev/null 2>&1
-  ```
+### Hinweise für Agenten (Grok, Claude, …)
 
-  Der Befehl endet mit Exit-Code `1`, wenn ein neuer Login nötig ist.
+**Nicht nötig, bitte nicht einrichten:**
+
+* kein Cronjob, launchd- oder systemd-Timer und keine geplante Aufgabe, die alle paar Minuten erneuert
+* keine tägliche Prüfung, ob „die Erneuerung noch läuft“. Einen Neustart des Rechners übersteht die
+  Sitzung, weil der Server beim nächsten Start bzw. bei der nächsten Abfrage selbst erneuert.
+
+**So geht es richtig:**
+
+1. Einfach die Wodis-Tools benutzen. Der Server kümmert sich selbst um Tokens.
+2. Meldet ein Tool „Nicht bei Wodis angemeldet“, den Benutzer um einen Login bitten: `wodis_login`
+   und den 6-stelligen Code per `wodis_login_otp`, oder `wodis_login_page`.
+3. Wer den Benutzer **vorab erinnern** möchte, liest `ssoSessionValidUntil` aus `wodis_auth_status`
+   und weist etwa 24 Stunden vorher auf den fälligen Login mit Code hin. Am besten passiert das, wenn
+   Wodis ohnehin benutzt wird, nicht über einen eigenen Zeitplan.
+
+`wodis-mcp keepalive` bleibt als optionaler Befehl erhalten (Exit-Code `1`, wenn ein Login nötig ist),
+etwa für Server, auf denen Wodis tagelang nicht abgefragt wird. Für den normalen Betrieb wird er nicht
+gebraucht.
 
 ## Werkzeuge
 
@@ -129,7 +143,7 @@ Typischer Ablauf: `wodis_search_objekte(strasse)` → `wodis_get_objekt` → `wo
 | `WODIS_USERNAME` / `WODIS_PASSWORD` | – | Optional für Agenten-Logins ohne Passwort im Chat |
 | `WODIS_MCP_HOME` | `~/.wodis-mcp` | Ordner für `session.json` (Rechte `0600`) |
 | `WODIS_SESSION_KEY` | – | Passphrase, verschlüsselt `session.json` mit AES-256-GCM |
-| `WODIS_KEEPALIVE_MINUTES` | `30` | Abstand der automatischen Erneuerung |
+| `WODIS_KEEPALIVE_MINUTES` | `30` | Abstand der zusätzlichen Erneuerung, solange der Server läuft (optional, siehe oben) |
 | `WODIS_LOGIN_HOST` / `WODIS_LOGIN_PORT` | `127.0.0.1` / zufällig | Adresse der Login-Seite. Für Server zum Beispiel `0.0.0.0` und `8787` |
 | `WODIS_LOGIN_PUBLIC_URL` | – | Öffentliche URL der Login-Seite hinter einem Proxy |
 | `WODIS_OPEN_BROWSER` | `1` | `0` öffnet die Login-Seite nicht automatisch |

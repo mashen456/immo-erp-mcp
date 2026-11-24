@@ -3,6 +3,12 @@
 Neue Einträge oben. Nach jedem Update den MCP-Server neu starten. Die Login-Sitzung bleibt erhalten,
 sofern ein Eintrag nichts anderes sagt.
 
+## 0.3.1
+
+* Doku: Die Sitzung hält sich selbst am Leben. Agenten sollen keine Cronjobs, Timer oder täglichen
+  Prüfungen einrichten. Ein neuer Login mit Code ist erst nach `ssoSessionValidUntil` (5 Tage) nötig.
+  Das steht auch in den Server-Hinweisen für Agenten.
+
 ## 0.3.0
 
 * Neu: Tool `wodis_get_mietkonto`. Es zeigt die Kontobewegungen des Mietkontos zu einem Mietvertrag
